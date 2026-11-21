@@ -1,369 +1,602 @@
-// combat.js — Port Verda: pukul, tembak, peluru & health pack.
+// combat.js — Port Verda (Builder B2: Vehicles & Life).
 //
-// Pukul (F): jarak pendek, ada cooldown, melukai pejalan kaki di dekat
-// pemain (mereka lari; dua-tiga pukulan menjatuhkan). Tembak (klik mouse):
-// butuh weapon 'pistol' dan ammo > 0; peluru adalah proyektil cepat yang
-// disimpan di state.bullets supaya render.js bisa menggambarnya. Menembak
-// menaikkan wanted +1 lewat police.js. Health pack muncul berkala di kota;
-// diambil saat pemain dekat (+25 health).
+// Punch, shooting, bullets, Harbor Kings gang enemies, health/ammo
+// pickups, and player damage / wasted. Written from scratch in this
+// session. Vanilla ES module, no library, no network, no external asset.
+// Pure logic over the shared `state` object.
 //
-// Kontrak state yang dipakai di sini:
-//   state.player {x, y, angle, speed, onFoot, carId, weapon, ammo}
-//   state.health: 0..100
-//   state.peds[] {id, x, y, state, health}
-//   state.cars[] {id, x, y, speed, driver, health}
-//   state.bullets[] {id, x, y, vx, vy, life, damage} — DITAMBAH modul ini
-//     (render.js menggambar tiap peluru sebagai garis/percik pendek).
-//   state.pickups[] {id, x, y, kind: 'health'} — DITAMBAH modul ini.
-//   state.flags.lastShot {x, y} + shotAge: dibaca peds.js (lari ketakutan).
-//   state.flags.wasted = true saat health habis (main.js mengubah mode).
+// STATE CONTRACT (agreed with B1 main.js / B3 missions.js):
+//   state = { mode, time, money, health, wanted, wantedTimer,
+//             player: { x, y, angle, speed, onFoot, inCar, carId, invulnerable },
+//             cars: [], traffic: [], peds: [], police: [],
+//             missions: { activeId, active, target, done: [], progress: {} },
+//             camera: { x, y }, input, muted, fx: [], toast, city }
+//   Combat state created here (all plain data): state.ammo (HUD reads it;
+//   hud.js shows `state.ammo ?? 30`), state.bullets,
+//   state.enemies (gang members), state.pickups, state.kills.
+//   A bullet is { x, y, vx, vy, ox, oy, damage, fromPlayer, ttl }.
+//   A gang enemy is { id, x, y, angle, speed, hp, maxHp, alive,
+//   gang: 'Harbor Kings', kind: 'gang', state, shootCooldown,
+//   meleeCooldown, hx, hy } — hp/alive match missions.js's guards.
+//   A pickup is { kind: 'health' | 'ammo', x, y }.
+//   Mission 5's guards live in state.peds (B3 missions.js spawns them
+//   with missionGuard:true, missionId:'m5', hp, alive) — punch and
+//   bullets damage them here, and updateCombat makes the living ones
+//   shoot back, so mission 5 is a real fight.
 //
-// Catatan integrasi: semua angka tuning modul ini dibaca dari CFG
-// (config.js) — satu sumber kebenaran, tanpa mengubah perilaku.
+// WIRING (main.js B1): step 6 calls updateCombat(state, dt, input) every
+// step while playing. main.js consumes the KeyF edge in step 1 before
+// this runs, so F is edge-detected here from the held-key set instead.
+// A mouse click shoots at mouse + camera (the same world conversion
+// main.js's fallback uses). punch(state) and shoot(state, x, y) are the
+// standalone primitives for tests and for missions.js.
+//
+// CRIMES: punching or shooting a pedestrian, and shooting at all, raise
+// the wanted level only when witnessed (police.js witnessed(): a patrol
+// car within 500 px or someone on foot within 300 px). Hitting a Harbor
+// Kings guard or gang member never counts as a crime against a civilian.
+
 import { CFG } from './config.js';
-import { addWanted } from './police.js';
+import { buildCity, clampToWorld, collidesBuilding, isWater } from './city.js';
+import { createRng } from './rng.js';
+import { saveGame } from './save.js';
+import { addWanted, witnessed } from './police.js';
+import { initAudio, playShot, playPunch, playPickup } from './audio.js';
 
-// ---------------------------------------------------------------- tuning --
-const WORLD_W = CFG.WORLD_W;
-const WORLD_H = CFG.WORLD_H;
+const rng = createRng(CFG.SEED + 404);
 
-const PUNCH_RANGE = CFG.PUNCH_RANGE; // jangkauan pukulan (px)
-const PUNCH_DAMAGE = CFG.PUNCH_DAMAGE; // damage per pukulan
-const PUNCH_COOLDOWN = CFG.PUNCH_COOLDOWN; // detik antar pukulan
-const BULLET_SPEED = CFG.BULLET_SPEED; // px/s
-const BULLET_LIFE = CFG.BULLET_LIFE; // detik umur peluru
-const BULLET_DAMAGE = CFG.BULLET_DAMAGE; // damage per peluru
-const BULLET_HIT_PED = CFG.BULLET_HIT_PED; // radius kena pejalan kaki (px)
-const BULLET_HIT_CAR = CFG.BULLET_HIT_CAR; // radius kena mobil (px)
-const BULLET_SPREAD = CFG.BULLET_SPREAD; // radian sebaran acak arah tembakan
-const HEALTH_PACK_INTERVAL = CFG.HEALTH_PACK_INTERVAL; // detik antar spawn health pack
-const HEALTH_PACK_MAX = CFG.HEALTH_PACK_MAX; // health pack maksimum yang hidup bersamaan
-const HEALTH_PACK_HEAL = CFG.HEALTH_PACK_HEAL; // health yang dipulihkan
-const PICKUP_RADIUS = CFG.PICKUP_RADIUS; // jarak ambil health pack (px)
-const MAX_HEALTH = CFG.PLAYER_MAX_HEALTH;
+const PUNCH_ARC = 1.4; // radians either side of the facing direction
+const PUNCH_REACH = CFG.PUNCH_RANGE + 20; // 54 px, like main.js's fallback
+const BULLET_SPEED = 950;
+const ENEMY_BULLET_SPEED = 700;
+const ENEMY_BULLET_DAMAGE = 9;
+const ENEMY_MELEE_DAMAGE = 12;
+const AMMO_START = 30; // matches hud.js's `state.ammo ?? 30` default
+const AMMO_MAX = 120;
+const KILL_REWARD = 25;
+const GANG = 'Harbor Kings';
 
-let nextBulletId = 1;
-let nextPickupId = 1;
-let nextFleePedId = 1;
+let cityCache = null;
+function cityOf(state) {
+  if (state && state.city) return state.city;
+  if (!cityCache) cityCache = buildCity(CFG.SEED);
+  return cityCache;
+}
+
+function ensureCombat(state) {
+  if (!Array.isArray(state.bullets)) state.bullets = [];
+  if (!Array.isArray(state.enemies)) state.enemies = [];
+  if (!Array.isArray(state.pickups)) state.pickups = [];
+  if (!Array.isArray(state.peds)) state.peds = [];
+  if (!Array.isArray(state.cars)) state.cars = [];
+  if (!Array.isArray(state.traffic)) state.traffic = [];
+  if (!Array.isArray(state.police)) state.police = [];
+  if (typeof state.ammo !== 'number') state.ammo = AMMO_START;
+  if (typeof state.kills !== 'number') state.kills = 0;
+  if (typeof state.punchCooldown !== 'number') state.punchCooldown = 0;
+  if (typeof state.shootCooldown !== 'number') state.shootCooldown = 0;
+  if (typeof state.health !== 'number') state.health = CFG.PLAYER_MAX_HEALTH;
+  if (typeof state.money !== 'number') state.money = CFG.START_MONEY;
+}
+
+function nextEnemyId(state) {
+  state._nextEnemyId = (state._nextEnemyId ?? 0) + 1;
+  return `gang-${state._nextEnemyId}`;
+}
+
+function dist(ax, ay, bx, by) {
+  return Math.hypot(ax - bx, ay - by);
+}
 
 function clamp(v, lo, hi) {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
-function dist(x1, y1, x2, y2) {
-  const dx = x2 - x1;
-  const dy = y2 - y1;
-  return Math.sqrt(dx * dx + dy * dy);
+function normAngle(a) {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
 }
 
-function ensureFlags(state) {
-  if (!state.flags || typeof state.flags !== 'object') state.flags = {};
-  return state.flags;
+function setToast(state, text, ttl = 3) {
+  state.toast = { text, ttl };
 }
 
-function ensureBullets(state) {
-  if (!Array.isArray(state.bullets)) state.bullets = [];
-  return state.bullets;
-}
-
-function ensurePickups(state) {
-  if (!Array.isArray(state.pickups)) state.pickups = [];
-  return state.pickups;
-}
-
-// Kota darurat bila main.js memanggil sebelum city siap (ditulis ulang di
-// sini agar modul ini berdiri sendiri, sama seperti modul B2 lainnya).
-function fallbackCity() {
-  const nodes = [];
-  const edges = [];
-  let id = 0;
-  for (let gx = 0; gx < 5; gx++) {
-    for (let gy = 0; gy < 4; gy++) {
-      nodes.push({ id: id++, x: 320 + gx * 640, y: 300 + gy * 600 });
-    }
+// Combat sounds (B3 audio.js). main.js's createAudio wiring does not
+// exist in audio.js, so nothing else starts the shared AudioContext:
+// combat starts it lazily on the first user-triggered punch/shot/pickup
+// (a key press / click is a user gesture, so the context may run), and
+// respects the game's mute flag. Audio never breaks combat.
+let audioStarted = false;
+function combatSound(state, play) {
+  if (state.muted) return;
+  if (!audioStarted) {
+    audioStarted = true;
+    try { initAudio(); } catch { /* audio never breaks combat */ }
   }
-  const at = (gx, gy) => gy * 5 + gx;
-  for (let gx = 0; gx < 5; gx++) {
-    for (let gy = 0; gy < 4; gy++) {
-      if (gx < 4) edges.push({ a: at(gx, gy), b: at(gx + 1, gy) });
-      if (gy < 3) edges.push({ a: at(gx, gy), b: at(gx, gy + 1) });
-    }
-  }
-  return {
-    roadGraph: { nodes, edges },
-    isRoad: () => true,
-    collidesBuilding: () => false,
-    pointInWater: () => false,
-  };
+  try { play(); } catch { /* audio never breaks combat */ }
 }
 
-function usableCity(city) {
-  if (city && city.roadGraph && Array.isArray(city.roadGraph.nodes)
-    && city.roadGraph.nodes.length > 0
-    && typeof city.collidesBuilding === 'function') {
-    return city;
-  }
-  return fallbackCity();
+function playerCar(state) {
+  if (!state.player.inCar || !state.player.carId) return null;
+  return state.cars.find((c) => c.id === state.player.carId) || null;
 }
 
-// ----------------------------------------------------------------- pukul ---
-export function punch(state) {
-  const player = state.player;
-  if (!player) return false;
-  const flags = ensureFlags(state);
-  if ((flags.punchCooldown || 0) > 0) return false;
-  flags.punchCooldown = PUNCH_COOLDOWN;
-  const peds = Array.isArray(state.peds) ? state.peds : [];
-  let best = null;
-  let bestD = PUNCH_RANGE;
-  for (const ped of peds) {
-    if (ped.state === 'down') continue;
-    const d = dist(player.x, player.y, ped.x, ped.y);
-    if (d < bestD) {
-      bestD = d;
-      best = ped;
-    }
-  }
-  if (!best) return false;
-  if (typeof best.health !== 'number') best.health = 100;
-  best.health -= PUNCH_DAMAGE;
-  // Korban pukulan langsung lari ketakutan menjauhi pemain.
-  best.state = 'flee';
-  best._fleeFrom = { x: player.x, y: player.y };
-  best._fleeTimer = 3.2;
-  best._pause = 0;
-  if (best.health <= 0) {
-    best.state = 'down';
-    best._downTimer = 6;
-    best.speed = 0;
-    // Anggota geng yang tumbang dihitung misi 5 (lihat hurtPed di bawah).
-    if (best.gang === true) {
-      flags.gangKills = (flags.gangKills || 0) + 1;
-    }
-  }
-  return true;
+function facingOf(state) {
+  const car = playerCar(state);
+  return car ? car.angle : state.player.angle;
 }
 
-// ---------------------------------------------------------------- tembak ---
-export function shoot(state, tx, ty) {
-  const player = state.player;
-  if (!player) return false;
-  if (player.weapon !== 'pistol') return false;
-  if (typeof player.ammo !== 'number' || player.ammo <= 0) return false;
-  if (typeof tx !== 'number' || typeof ty !== 'number') return false;
-  player.ammo -= 1;
-  const flags = ensureFlags(state);
-  flags.lastShot = { x: player.x, y: player.y };
-  flags.shotAge = 0;
-  addWanted(state, 1);
-  const base = Math.atan2(ty - player.y, tx - player.x);
-  const angle = base + (Math.random() - 0.5) * 2 * BULLET_SPREAD;
-  // Peluru keluar dari tangan / moncong: sedikit di depan pemain.
-  const ox = player.x + Math.cos(base) * 20;
-  const oy = player.y + Math.sin(base) * 20;
-  ensureBullets(state).push({
-    id: 'bul_' + (nextBulletId++),
-    x: ox,
-    y: oy,
-    vx: Math.cos(angle) * BULLET_SPEED,
-    vy: Math.sin(angle) * BULLET_SPEED,
-    life: BULLET_LIFE,
-    damage: BULLET_DAMAGE,
+// --- player damage -------------------------------------------------------------
+
+/**
+ * Hurt the player. Brief invulnerability (0.35 s) stops a burst of enemy
+ * fire from melting the health bar in one frame. At 0 health the run is
+ * wasted. Returns true when damage landed.
+ */
+export function damagePlayer(state, amount, source = 'hit') {
+  ensureCombat(state);
+  if (state.mode !== 'playing') return false;
+  if (state.player.invulnerable > 0) return false;
+  state.health = Math.max(0, state.health - amount);
+  state.player.invulnerable = 0.35;
+  state.lastDamageAt = state.time;
+  state.fx.push({
+    kind: 'punch',
+    x: state.player.x, y: state.player.y,
+    ttl: 0.18, max: 0.18,
   });
+  if (state.health <= 0) {
+    state.health = 0;
+    state.mode = 'wasted';
+    setToast(state, 'Kamu tumbang! Tekan Enter untuk mulai lagi.');
+    try { saveGame(state); } catch { /* saving never breaks the game */ }
+  }
   return true;
 }
 
-// ------------------------------------------------------------ damage pemain -
-export function damagePlayer(state, n) {
-  if (typeof state.health !== 'number') state.health = MAX_HEALTH;
-  state.health = Math.max(0, state.health - n);
-  if (state.health <= 0) {
-    ensureFlags(state).wasted = true;
-  }
+export function healPlayer(state, amount) {
+  ensureCombat(state);
+  state.health = Math.min(CFG.PLAYER_MAX_HEALTH, state.health + amount);
   return state.health;
 }
 
-// ------------------------------------------------------------- health pack ---
-function spawnHealthPack(state, city) {
-  const graph = usableCity(city).roadGraph;
-  const node = graph.nodes[Math.floor(Math.random() * graph.nodes.length)];
-  const pickups = ensurePickups(state);
-  pickups.push({
-    id: 'hp_' + (nextPickupId++),
-    x: clamp(node.x + (Math.random() - 0.5) * 120, 24, WORLD_W - 24),
-    y: clamp(node.y + (Math.random() - 0.5) * 120, 24, WORLD_H - 24),
-    kind: 'health',
+// --- pickups -------------------------------------------------------------------
+
+export function spawnHealthPack(state, x, y) {
+  ensureCombat(state);
+  state.pickups.push({ kind: 'health', x, y });
+  return state.pickups[state.pickups.length - 1];
+}
+
+export function spawnAmmoBox(state, x, y) {
+  ensureCombat(state);
+  state.pickups.push({ kind: 'ammo', x, y });
+  return state.pickups[state.pickups.length - 1];
+}
+
+// --- gang enemies --------------------------------------------------------------
+
+/**
+ * Spawn `count` Harbor Kings members around (x, y) — the gang for
+ * mission 5. Positions that land inside a building or the water are
+ * nudged onto the nearest road. Enemies fight back (see updateCombat).
+ */
+export function spawnGangEnemies(state, x, y, count = 4) {
+  ensureCombat(state);
+  const city = cityOf(state);
+  const spots = [[0, 0], [-70, 40], [70, 30], [-40, -70], [60, -70], [0, 90], [-90, -30], [90, -40]];
+  const made = [];
+  for (let i = 0; i < count; i++) {
+    const off = spots[i % spots.length];
+    let ex = x + off[0];
+    let ey = y + off[1];
+    if (collidesBuilding(city, ex, ey, 12) || isWater(city, ex, ey)) {
+      const near = city.nearestRoad(ex, ey);
+      ex = near ? near.x : x;
+      ey = near ? near.y : y;
+    }
+    const c = clampToWorld(ex, ey, 16);
+    const enemy = {
+      id: nextEnemyId(state),
+      x: c.x, y: c.y,
+      angle: rng.next() * Math.PI * 2,
+      speed: 150,
+      hp: 100, maxHp: 100,
+      alive: true,
+      gang: GANG,
+      kind: 'gang',
+      state: 'chase',
+      shootCooldown: 0.5 + rng.next(),
+      meleeCooldown: 0,
+      hx: c.x, hy: c.y,
+    };
+    state.enemies.push(enemy);
+    made.push(enemy);
+  }
+  return made;
+}
+
+function killEnemy(state, enemy) {
+  const idx = state.enemies.indexOf(enemy);
+  if (idx >= 0) state.enemies.splice(idx, 1);
+  state.kills += 1;
+  state.money += KILL_REWARD;
+  if (rng.next() < 0.25) spawnHealthPack(state, enemy.x, enemy.y);
+  setToast(state, `Harbor Kings tumbang! +$${KILL_REWARD}`);
+}
+
+function damageEnemy(state, enemy, amount, kx, ky) {
+  enemy.hp -= amount;
+  if (kx || ky) {
+    const city = cityOf(state);
+    const nx = enemy.x + kx * 14;
+    const ny = enemy.y + ky * 14;
+    if (!collidesBuilding(city, nx, ny, 12) && !isWater(city, nx, ny)) {
+      enemy.x = nx; enemy.y = ny;
+    }
+    const c = clampToWorld(enemy.x, enemy.y, 16);
+    enemy.x = c.x; enemy.y = c.y;
+  }
+  if (enemy.hp <= 0) killEnemy(state, enemy);
+}
+
+// --- punch ---------------------------------------------------------------------
+
+/**
+ * F: a close-range swing (on foot only). Hits the nearest hostile or
+ * pedestrian inside 54 px and a 160-degree arc in front of the player.
+ * A guard or gang member takes 20 damage; a pedestrian is knocked down
+ * and the swing is a crime when anyone sees it.
+ */
+export function punch(state) {
+  ensureCombat(state);
+  if (state.mode !== 'playing') return false;
+  if (state.player.inCar) return false;
+  if (state.punchCooldown > 0) return false;
+  state.punchCooldown = CFG.PUNCH_COOLDOWN;
+  combatSound(state, playPunch);
+  const p = state.player;
+  const facing = facingOf(state);
+  state.fx.push({
+    kind: 'punch',
+    x: p.x + Math.cos(facing) * 22,
+    y: p.y + Math.sin(facing) * 22,
+    ttl: 0.18, max: 0.18,
+  });
+
+  let best = null;
+  let bestD = PUNCH_REACH;
+  let bestKind = null;
+  const consider = (target, kind) => {
+    const d = dist(p.x, p.y, target.x, target.y);
+    if (d >= bestD) return;
+    const diff = Math.abs(normAngle(Math.atan2(target.y - p.y, target.x - p.x) - facing));
+    if (diff > PUNCH_ARC) return;
+    best = target; bestD = d; bestKind = kind;
+  };
+  for (const e of state.enemies) if (e.alive !== false) consider(e, 'enemy');
+  for (const ped of state.peds) {
+    if (ped.down || ped.alive === false) continue;
+    consider(ped, ped.missionGuard ? 'guard' : 'ped');
+  }
+  if (!best) return false;
+
+  const kx = Math.cos(facing);
+  const ky = Math.sin(facing);
+  if (bestKind === 'enemy') {
+    damageEnemy(state, best, CFG.PUNCH_DAMAGE, kx, ky);
+  } else if (bestKind === 'guard') {
+    best.hp = (best.hp ?? 100) - CFG.PUNCH_DAMAGE;
+    if (best.hp <= 0) { best.alive = false; best.down = true; }
+  } else {
+    best.down = true;
+    best.downTimer = 4;
+    best.state = 'flee';
+    best.fleeTimer = 2.5;
+    best.fleeX = p.x; best.fleeY = p.y;
+    state.dangerZone = { x: p.x, y: p.y, radius: 220, ttl: 1.5, kind: 'punch' };
+    if (witnessed(state, p.x, p.y)) {
+      if (addWanted(state, CFG.CRIME_HEAT_PUNCH, 'pukul')) {
+        setToast(state, 'Kamu memukul pejalan kaki! Polisi waspada.');
+      }
+    }
+  }
+  return true;
+}
+
+// --- shooting ------------------------------------------------------------------
+
+/**
+ * Fire one round at a world point (mouse click). Works on foot and from
+ * a car (worse spread while driving). Consumes one ammo, starts a bullet,
+ * paints a tracer, and scares nearby pedestrians. Firing is a crime
+ * when anyone sees it. Returns false when nothing was fired.
+ */
+export function shoot(state, targetX, targetY) {
+  ensureCombat(state);
+  if (state.mode !== 'playing') return false;
+  if (state.shootCooldown > 0) return false;
+  if (state.ammo <= 0) {
+    setToast(state, 'Amunisi habis! Cari kotak amunisi.');
+    state.shootCooldown = 0.3;
+    return false;
+  }
+  state.shootCooldown = CFG.SHOOT_COOLDOWN;
+  state.ammo -= 1;
+  combatSound(state, playShot);
+  const p = state.player;
+  const car = playerCar(state);
+  const facing = facingOf(state);
+  const mx = p.x + Math.cos(facing) * 20;
+  const my = p.y + Math.sin(facing) * 20;
+  const spread = (car ? 0.09 : 0.05) * (rng.next() * 2 - 1);
+  const aim = Math.atan2(targetY - my, targetX - mx) + spread;
+  state.bullets.push({
+    x: mx, y: my,
+    vx: Math.cos(aim) * BULLET_SPEED,
+    vy: Math.sin(aim) * BULLET_SPEED,
+    ox: mx, oy: my,
+    damage: CFG.SHOOT_DAMAGE,
+    fromPlayer: true,
+    ttl: 1,
+  });
+  const ex = mx + Math.cos(aim) * CFG.SHOOT_RANGE;
+  const ey = my + Math.sin(aim) * CFG.SHOOT_RANGE;
+  state.fx.push({ kind: 'tracer', x1: mx, y1: my, x2: ex, y2: ey, ttl: 0.12, max: 0.12 });
+  state.dangerZone = { x: p.x, y: p.y, radius: 280, ttl: 1.2, kind: 'shot' };
+  if (witnessed(state, p.x, p.y)) {
+    if (addWanted(state, CFG.CRIME_HEAT_SHOOT, 'tembak')) {
+      setToast(state, 'Tembakan! Wanted naik.');
+    }
+  }
+  return true;
+}
+
+function fireEnemyBullet(state, from, tx, ty) {
+  const aim = Math.atan2(ty - from.y, tx - from.x) + 0.12 * (rng.next() * 2 - 1);
+  state.bullets.push({
+    x: from.x, y: from.y,
+    vx: Math.cos(aim) * ENEMY_BULLET_SPEED,
+    vy: Math.sin(aim) * ENEMY_BULLET_SPEED,
+    ox: from.x, oy: from.y,
+    damage: ENEMY_BULLET_DAMAGE,
+    fromPlayer: false,
+    ttl: 1,
+  });
+  state.fx.push({
+    kind: 'tracer',
+    x1: from.x, y1: from.y,
+    x2: from.x + Math.cos(aim) * 160,
+    y2: from.y + Math.sin(aim) * 160,
+    ttl: 0.1, max: 0.1,
   });
 }
 
-function hurtPed(state, ped, damage, fromX, fromY) {
-  if (typeof ped.health !== 'number') ped.health = 100;
-  ped.health -= damage;
-  if (ped.health <= 0) {
-    ped.state = 'down';
-    ped._downTimer = 6;
-    ped.speed = 0;
-    // Anggota geng yang tumbang dihitung misi 5: pejalan kaki 'down'
-    // dihapus peds.js setelah beberapa detik, jadi hitungannya harus
-    // menetap di flags, bukan hanya di badan ped (lihat countGangDown
-    // di missions.js).
-    if (ped.gang === true) {
-      const flags = ensureFlags(state);
-      flags.gangKills = (flags.gangKills || 0) + 1;
-    }
-  } else {
-    ped.state = 'flee';
-    ped._fleeFrom = { x: fromX, y: fromY };
-    ped._fleeTimer = 3.2;
-    ped._pause = 0;
-  }
+// Move an enemy or guard one step, sliding along buildings and water.
+function moveFighter(city, e, nx, ny) {
+  const blocked = (x, y) => collidesBuilding(city, x, y, 12) || isWater(city, x, y);
+  if (!blocked(nx, ny)) { e.x = nx; e.y = ny; return; }
+  // A slide only counts when it actually moves (see vehicles.js).
+  if (nx !== e.x && !blocked(nx, e.y)) { e.x = nx; return; }
+  if (ny !== e.y && !blocked(e.x, ny)) { e.y = ny; }
 }
 
-function updateBullets(state, dt, city) {
-  const bullets = ensureBullets(state);
-  const liveCity = usableCity(city);
-  const peds = Array.isArray(state.peds) ? state.peds : [];
-  const cars = Array.isArray(state.cars) ? state.cars : [];
-  for (let i = bullets.length - 1; i >= 0; i--) {
-    const b = bullets[i];
-    b.life -= dt;
+// --- main.js step-6 entry point --------------------------------------------------
+
+let prevKeys = new Set();
+
+/**
+ * The main.js step-6 entry point. Reads F (edge-detected from the held
+ * key set, because main.js consumes the KeyF edge in step 1) and mouse
+ * clicks (world = mouse + camera), steps bullets, runs gang-enemy and
+ * guard AI, and hands out pickups.
+ */
+export function updateCombat(state, dt, input) {
+  ensureCombat(state);
+  if (state.mode !== 'playing') {
+    if (input && input.keys instanceof Set) prevKeys = new Set(input.keys);
+    return;
+  }
+  const city = cityOf(state);
+  const p = state.player;
+  state.punchCooldown = Math.max(0, state.punchCooldown - dt);
+  state.shootCooldown = Math.max(0, state.shootCooldown - dt);
+
+  // F punch: edge-detect the held key (main.js ate the KeyF edge already).
+  if (input) {
+    let pressedF = false;
+    if (input.keys instanceof Set) {
+      pressedF = input.keys.has('KeyF') && !prevKeys.has('KeyF');
+      prevKeys = new Set(input.keys);
+    }
+    if (!pressedF && typeof input.keyPressed === 'function' && input.keyPressed('KeyF')) pressedF = true;
+    if (!pressedF && typeof input.wasPressed === 'function' && input.wasPressed('KeyF')) pressedF = true;
+    if (pressedF) punch(state);
+
+    // Mouse click: shoot at the world point under the cursor.
+    if (input.mouse && input.mouse.clicked) {
+      const cam = state.camera || { x: 0, y: 0 };
+      const wx = input.mouse.x + cam.x;
+      const wy = input.mouse.y + cam.y;
+      input.mouse.clicked = false;
+      shoot(state, wx, wy);
+    }
+  }
+
+  // --- bullets -----------------------------------------------------------------
+  for (let i = state.bullets.length - 1; i >= 0; i--) {
+    const b = state.bullets[i];
     b.x += b.vx * dt;
     b.y += b.vy * dt;
-    let dead = b.life <= 0
-      || b.x < 0 || b.y < 0 || b.x > WORLD_W || b.y > WORLD_H;
-    if (!dead && liveCity.collidesBuilding
-      && liveCity.collidesBuilding(b.x, b.y, 2)) {
-      dead = true; // peluru berhenti di dinding bangunan
+    b.ttl -= dt;
+    const travelled = dist(b.x, b.y, b.ox, b.oy);
+    if (b.ttl <= 0 || travelled > CFG.SHOOT_RANGE + 40) {
+      state.bullets.splice(i, 1);
+      continue;
     }
-    if (!dead) {
-      const shooter = state.player || { x: b.x, y: b.y };
-      for (const ped of peds) {
-        if (ped.state === 'down') continue;
-        if (dist(b.x, b.y, ped.x, ped.y) < BULLET_HIT_PED) {
-          hurtPed(state, ped, b.damage, shooter.x, shooter.y);
-          dead = true;
+    if (collidesBuilding(city, b.x, b.y, 0) || isWater(city, b.x, b.y)) {
+      state.bullets.splice(i, 1);
+      continue;
+    }
+    let consumed = false;
+    if (b.fromPlayer) {
+      // Gang enemies.
+      for (const e of [...state.enemies]) {
+        if (e.alive === false) continue;
+        if (dist(b.x, b.y, e.x, e.y) < 20) {
+          damageEnemy(state, e, b.damage, b.vx / BULLET_SPEED, b.vy / BULLET_SPEED);
+          consumed = true;
           break;
         }
       }
-    }
-    if (!dead) {
-      for (const car of cars) {
-        // Jangan menembak mobil sendiri dari dalam mobil itu.
-        if (state.player && !state.player.onFoot
-          && car.id === state.player.carId) continue;
-        if (dist(b.x, b.y, car.x, car.y) < BULLET_HIT_CAR) {
-          car.health = Math.max(0, (car.health || 100) - b.damage);
-          if (car.health <= 0) disableCar(state, car);
-          dead = true;
-          break;
+      // Mission guards (mission 5, in state.peds).
+      if (!consumed) {
+        for (const ped of state.peds) {
+          if (!ped.missionGuard || ped.alive === false) continue;
+          if (dist(b.x, b.y, ped.x, ped.y) < 18) {
+            ped.hp = (ped.hp ?? 100) - b.damage;
+            if (ped.hp <= 0) { ped.alive = false; ped.down = true; }
+            consumed = true;
+            break;
+          }
         }
       }
+      // Pedestrians: a hit knocks them down and is a serious crime.
+      if (!consumed) {
+        for (const ped of state.peds) {
+          if (ped.down || ped.missionGuard) continue;
+          if (dist(b.x, b.y, ped.x, ped.y) < 16) {
+            ped.down = true;
+            ped.downTimer = 4;
+            ped.state = 'flee';
+            ped.fleeTimer = 2.5;
+            ped.fleeX = p.x; ped.fleeY = p.y;
+            state.dangerZone = { x: ped.x, y: ped.y, radius: 260, ttl: 1.5, kind: 'shot' };
+            if (addWanted(state, CFG.CRIME_HEAT_SHOOT, 'tembak')) {
+              setToast(state, 'Kamu menembak pejalan kaki! Wanted naik.');
+            }
+            consumed = true;
+            break;
+          }
+        }
+      }
+      // Patrol cars: sparks and a star, but cars have no health model.
+      if (!consumed) {
+        for (const cop of state.police) {
+          if (dist(b.x, b.y, cop.x, cop.y) < 24) {
+            state.fx.push({ kind: 'punch', x: b.x, y: b.y, ttl: 0.15, max: 0.15 });
+            if (addWanted(state, 1, 'tembak polisi')) setToast(state, 'Kamu menembak polisi!');
+            consumed = true;
+            break;
+          }
+        }
+      }
+      // Traffic cars: the driver bails out and the car is abandoned.
+      if (!consumed) {
+        for (let t = 0; t < state.traffic.length; t++) {
+          const car = state.traffic[t];
+          if (dist(b.x, b.y, car.x, car.y) < 24) {
+            state.traffic.splice(t, 1);
+            car.speed = 0;
+            car.parked = true;
+            car.abandoned = true;
+            state.cars.push(car);
+            const side = car.angle + Math.PI / 2;
+            const driver = {
+              id: `ped-driver-${car.id}`,
+              x: car.x + Math.cos(side) * 30,
+              y: car.y + Math.sin(side) * 30,
+              angle: car.angle, speed: 0, color: '#e0a458',
+              down: false, from: -1, to: -1, t: 0, side: 1,
+              state: 'flee', fleeTimer: 3, fleeX: car.x, fleeY: car.y,
+            };
+            const c = clampToWorld(driver.x, driver.y, CFG.PED_RADIUS);
+            driver.x = c.x; driver.y = c.y;
+            state.peds.push(driver);
+            if (witnessed(state, car.x, car.y)) {
+              addWanted(state, 1, 'tembak mobil');
+            }
+            consumed = true;
+            break;
+          }
+        }
+      }
+    } else if (dist(b.x, b.y, p.x, p.y) < 16) {
+      // Enemy fire: the player car does not shield the driver.
+      damagePlayer(state, b.damage, 'shot');
+      consumed = true;
     }
-    if (dead) bullets.splice(i, 1);
-  }
-}
-
-// Cari ruas jalan terdekat dari sebuah titik, supaya pejalan kaki yang
-// dibuat dadakan (mis. sopir yang keluar dari mobil hancur) tetap punya
-// _edge yang sah — updatePeds membaca ped._edge setiap frame, dan _edge
-// null akan menjatuhkan game.
-function nearestEdge(graph, x, y) {
-  let best = null;
-  let bestT = 0;
-  let bestD = Infinity;
-  for (const edge of graph.edges) {
-    const a = graph.nodes[edge.a];
-    const b = graph.nodes[edge.b];
-    if (!a || !b) continue;
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
-    const len2 = dx * dx + dy * dy || 1;
-    let t = ((x - a.x) * dx + (y - a.y) * dy) / len2;
-    t = clamp(t, 0, 1);
-    const px = a.x + dx * t;
-    const py = a.y + dy * t;
-    const d = (x - px) * (x - px) + (y - py) * (y - py);
-    if (d < bestD) {
-      bestD = d;
-      best = edge;
-      bestT = t;
-    }
-  }
-  return best ? { a: best.a, b: best.b, t: bestT } : null;
-}
-
-// Mobil yang hancur ditembak: berhenti; sopir lalu lintas keluar dan lari.
-function disableCar(state, car) {
-  car.speed = 0;
-  if (car.driver === 'traffic') {
-    car.driver = null;
-    car.parked = true;
-    const peds = Array.isArray(state.peds) ? state.peds : [];
-    const fleeFrom = state.player
-      ? { x: state.player.x, y: state.player.y } : { x: car.x, y: car.y };
-    const graph = usableCity(state.city).roadGraph;
-    const snap = nearestEdge(graph, car.x + 24, car.y)
-      || (graph.edges[0] ? { a: graph.edges[0].a, b: graph.edges[0].b, t: 0 } : null);
-    peds.push({
-      id: 'ped_flee_' + (nextFleePedId++),
-      x: car.x + 24,
-      y: car.y,
-      angle: 0,
-      speed: 175,
-      state: 'flee',
-      health: 100,
-      color: '#e67e22',
-      // _edge wajib ada dan sah: updatePeds membacanya tiap frame.
-      _edge: snap ? { a: snap.a, b: snap.b } : { a: 0, b: 1 },
-      _t: snap ? snap.t : 0,
-      _dir: 1,
-      _side: 1,
-      _pause: 0,
-      _fleeFrom: fleeFrom,
-      _fleeTimer: 3.2,
-      _crimeAt: -999,
-      _downTimer: 0,
-      _seed: Math.random() * Math.PI * 2,
-    });
-  }
-}
-
-// ----------------------------------------------------------------- update ---
-export function updateCombat(state, dt, city) {
-  if (!state) return;
-  if (!(dt > 0)) return;
-  const flags = ensureFlags(state);
-  if (typeof state.health !== 'number') state.health = MAX_HEALTH;
-
-  // Cooldown pukulan & umur tembakan menua dengan dt (tidak bergantung
-  // pada state.time, supaya modul tetap jalan apa pun main loop B1).
-  if ((flags.punchCooldown || 0) > 0) {
-    flags.punchCooldown = Math.max(0, flags.punchCooldown - dt);
-  }
-  if (typeof flags.shotAge === 'number') flags.shotAge += dt;
-
-  updateBullets(state, dt, city || state.city);
-
-  // Spawn health pack berkala selama belum mencapai batas.
-  flags.healthPackTimer = (flags.healthPackTimer || 0) + dt;
-  const pickups = ensurePickups(state);
-  if (flags.healthPackTimer >= HEALTH_PACK_INTERVAL
-    && pickups.length < HEALTH_PACK_MAX) {
-    flags.healthPackTimer = 0;
-    spawnHealthPack(state, city || state.city);
+    if (consumed) state.bullets.splice(i, 1);
   }
 
-  // Ambil health pack saat pemain dekat.
-  const player = state.player;
-  if (player) {
-    for (let i = pickups.length - 1; i >= 0; i--) {
-      const p = pickups[i];
-      if (p.kind !== 'health') continue;
-      if (dist(player.x, player.y, p.x, p.y) < PICKUP_RADIUS) {
-        state.health = Math.min(MAX_HEALTH, state.health + HEALTH_PACK_HEAL);
-        flags.lastPickup = { kind: 'health', x: p.x, y: p.y };
-        pickups.splice(i, 1);
+  // --- gang enemies: chase, shoot, brawl ---------------------------------------
+  for (const e of [...state.enemies]) {
+    if (e.alive === false) continue;
+    e.shootCooldown = Math.max(0, (e.shootCooldown ?? 0) - dt);
+    e.meleeCooldown = Math.max(0, (e.meleeCooldown ?? 0) - dt);
+    const d = dist(e.x, e.y, p.x, p.y);
+    if (d < 420) {
+      e.state = 'chase';
+      e.angle = Math.atan2(p.y - e.y, p.x - e.x);
+      if (d > 60) {
+        moveFighter(city, e, e.x + Math.cos(e.angle) * e.speed * dt, e.y + Math.sin(e.angle) * e.speed * dt);
+      }
+      if (d < 320 && e.shootCooldown <= 0) {
+        fireEnemyBullet(state, e, p.x, p.y);
+        e.shootCooldown = 1.1 + rng.next() * 0.4;
+      }
+      if (d < 42 && e.meleeCooldown <= 0) {
+        damagePlayer(state, ENEMY_MELEE_DAMAGE, 'melee');
+        e.meleeCooldown = 0.8;
+      }
+    } else {
+      // Too far to care: drift back toward the home spot.
+      e.state = 'idle';
+      const hd = dist(e.x, e.y, e.hx, e.hy);
+      if (hd > 60) {
+        const a = Math.atan2(e.hy - e.y, e.hx - e.x);
+        e.angle = a;
+        moveFighter(city, e, e.x + Math.cos(a) * 60 * dt, e.y + Math.sin(a) * 60 * dt);
       }
     }
+    const c = clampToWorld(e.x, e.y, 16);
+    e.x = c.x; e.y = c.y;
+  }
+
+  // --- mission guards (mission 5): stand post and shoot back ------------------
+  for (const ped of state.peds) {
+    if (!ped.missionGuard || ped.alive === false) continue;
+    ped.shootCooldown = Math.max(0, (ped.shootCooldown ?? 0) - dt);
+    const d = dist(ped.x, ped.y, p.x, p.y);
+    if (d < 380) {
+      ped.angle = Math.atan2(p.y - ped.y, p.x - ped.x);
+      if (d < 320 && ped.shootCooldown <= 0) {
+        fireEnemyBullet(state, ped, p.x, p.y);
+        ped.shootCooldown = 1.2 + rng.next() * 0.5;
+      }
+    }
+  }
+
+  // --- pickups ------------------------------------------------------------------
+  for (let i = state.pickups.length - 1; i >= 0; i--) {
+    const pk = state.pickups[i];
+    if (dist(p.x, p.y, pk.x, pk.y) >= 28) continue;
+    if (pk.kind === 'health') {
+      healPlayer(state, 40);
+      setToast(state, 'Kesehatan +40');
+    } else {
+      state.ammo = Math.min(AMMO_MAX, state.ammo + 24);
+      setToast(state, 'Amunisi +24');
+    }
+    combatSound(state, playPickup);
+    state.pickups.splice(i, 1);
+  }
+
+  // Wasted is also caught here in case health hit 0 outside damagePlayer.
+  if (state.health <= 0 && state.mode === 'playing') {
+    state.health = 0;
+    state.mode = 'wasted';
+    try { saveGame(state); } catch { /* saving never breaks the game */ }
   }
 }

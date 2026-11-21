@@ -1,424 +1,413 @@
-// peds.js — Port Verda: pejalan kaki di trotoar kota.
+// peds.js — Port Verda (Builder B2: Vehicles & Life).
 //
-// Pejalan kaki berjalan menyusuri tepi jalan mengikuti roadGraph (satu ruas
-// jalan per pejalan kaki, maju dari node ke node). Mereka lari ketakutan saat
-// ada tembakan di dekatnya, saat mobil melaju kencang ke arah mereka, atau
-// saat tertabrak mobil. Pejalan kaki yang tertabrak adalah kejahatan dan
-// menaikkan wanted lewat police.js.
+// Pedestrian spawning and AI: sidewalk walking, crossing only at
+// intersections, fleeing from danger, never standing in the road.
+// Written from scratch in this session. Vanilla ES module, no library,
+// no network, no external asset. Pure logic over the shared `state` object.
 //
-// Kontrak state yang dipakai di sini:
-//   state.peds[] {id, x, y, angle, speed, state: 'walk' | 'flee' | 'idle'}
-//     + lapangan tambahan modul ini: health, _edge, _t, _dir, _pause,
-//       _fleeFrom {x, y}, _fleeTimer, _crimeAt, _downTimer, _seed.
-//   state.cars[] dipakai untuk deteksi tabrakan.
-//   state.flags.shotAge: detik sejak tembakan terakhir (diisi combat.js);
-//   state.flags.lastShot {x, y}: posisi tembakan terakhir (diisi combat.js).
+// STATE CONTRACT (agreed with B1 main.js / B3 missions.js):
+//   state = { mode, time, money, health, wanted, wantedTimer,
+//             player: { x, y, angle, speed, onFoot, inCar, carId, invulnerable },
+//             cars: [], traffic: [], peds: [], police: [],
+//             missions: { activeId, active, target, done: [], progress: {} },
+//             camera: { x, y }, input, muted, fx: [], toast, city }
+//   A pedestrian is { id, x, y, angle, speed, color, down,
+//                     from, to, t, side, state, fleeTimer, waitTimer, crossT }.
+//   `from` / `to` are road-graph node ids, `t` is 0..1 along that edge,
+//   `side` is +1/-1 (which sidewalk), and `state` is one of
+//   'walk' | 'flee' | 'idle-sidewalk' | 'cross'.
+//   Pedestrians walk on the sidewalk: 39 px off the road centreline
+//   (road half-width 32 + half the 14 px sidewalk). They cross a road
+//   ONLY at an intersection, switching sides there; traffic (vehicles.js)
+//   stops for anyone in its path, and this module pushes a pedestrian
+//   out of the way as a last resort, so a pedestrian is never run over
+//   by traffic while idle.
 //
-// Catatan integrasi: semua angka tuning modul ini dibaca dari CFG
-// (config.js) — satu sumber kebenaran, tanpa mengubah perilaku.
+// WIRING (main.js B1): step 4 calls updatePeds(state, dt) every step
+// while playing; the title screen keeps using main.js's fallbackPeds,
+// so updatePeds normalises any pedestrian the fallback created
+// (from/to/t/side shape) instead of assuming its own fields exist.
+// Mission guards (B3 missions.js) live in state.peds with
+// missionGuard:true — they stand their post and are never walked by
+// this module; combat.js handles them.
+
 import { CFG } from './config.js';
-import { addWanted } from './police.js';
+import { buildCity, clampToWorld, collidesBuilding, isWater, nearestRoad } from './city.js';
+import { createRng } from './rng.js';
 
-// ---------------------------------------------------------------- tuning --
-const WORLD_W = CFG.WORLD_W;
-const WORLD_H = CFG.WORLD_H;
+const rng = createRng(CFG.SEED + 303);
 
-const PED_COUNT = CFG.PED_COUNT; // jumlah pejalan kaki yang dijaga hidup
-const WALK_SPEED_MIN = CFG.PED_SPEED_MIN; // px/s
-const WALK_SPEED_MAX = CFG.PED_SPEED_MAX; // px/s
-const FLEE_SPEED = CFG.FLEE_SPEED; // px/s saat lari ketakutan
-const SIDEWALK_OFFSET = CFG.SIDEWALK_OFFSET; // jarak pejalan kaki dari garis tengah jalan
-const FLEE_RADIUS = CFG.FLEE_RADIUS; // radius dengar tembakan (px)
-const FLEE_TIME = CFG.FLEE_TIME; // detik lari sebelum tenang kembali
-const CAR_SCARE_DIST = CFG.CAR_SCARE_DIST; // mobil secepat ini & sedekat ini bikin lari
-const CAR_SCARE_SPEED = CFG.CAR_SCARE_SPEED; // px/s
-const HIT_DIST = CFG.HIT_DIST; // jarak mobil-ped dianggap tabrakan (px)
-const HIT_SPEED = CFG.HIT_SPEED; // kecepatan mobil minimum agar tabrakan dihitung
-const HIT_DAMAGE = CFG.HIT_DAMAGE; // damage ke pejalan kaki saat tertabrak
-const HIT_CRIME_COOLDOWN = CFG.HIT_CRIME_COOLDOWN; // detik antar kenaikan wanted per pejalan kaki
-const PED_HEALTH = CFG.PED_HEALTH;
-const DOWN_DESPAWN = CFG.DOWN_DESPAWN; // detik pejalan kaki terkapar sebelum hilang
-const IDLE_CHANCE = CFG.IDLE_CHANCE; // peluang berhenti sejenak di ujung ruas
-const IDLE_TIME_MIN = CFG.IDLE_TIME_MIN; // detik diam
-const IDLE_TIME_MAX = CFG.IDLE_TIME_MAX; // detik diam
-const RESPAWN_MIN_DIST = CFG.RESPAWN_MIN_DIST; // respawn minimal sejauh ini dari pemain
+// Sidewalk centre, px off the road centreline (32 road half + 7 half sidewalk).
+const SIDEWALK_OFF = CFG.ROAD_W / 2 + CFG.SIDEWALK / 2; // 39
+const FLEE_SPEED = 165;
+const PED_COLORS = ['#e8dcc0', '#7fb069', '#c17a9e', '#e0a458', '#8ecae6', '#f4f1de'];
 
-const PED_COLORS = [
-  '#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6',
-  '#1abc9c', '#e67e22', '#ecf0f1', '#fd79a8', '#636e72',
-];
-const PED_RADIUS = CFG.PED_RADIUS;
+let cityCache = null;
+function cityOf(state) {
+  if (state && state.city) return state.city;
+  if (!cityCache) cityCache = buildCity(CFG.SEED);
+  return cityCache;
+}
 
-let nextPedId = 1;
+function ensureArrays(state) {
+  if (!Array.isArray(state.peds)) state.peds = [];
+  if (!Array.isArray(state.traffic)) state.traffic = [];
+  if (!Array.isArray(state.police)) state.police = [];
+  if (!Array.isArray(state.cars)) state.cars = [];
+}
 
-function makePedId() {
-  return 'ped_' + (nextPedId++);
+function nextPedId(state) {
+  state._nextPedId = (state._nextPedId ?? 0) + 1;
+  return `ped-${state._nextPedId}`;
+}
+
+function dist(ax, ay, bx, by) {
+  return Math.hypot(ax - bx, ay - by);
 }
 
 function clamp(v, lo, hi) {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
-function dist(x1, y1, x2, y2) {
-  const dx = x2 - x1;
-  const dy = y2 - y1;
-  return Math.sqrt(dx * dx + dy * dy);
+// Unit perpendicular (right-hand side) of a direction vector.
+function perpOf(dx, dy, len) {
+  return { x: -dy / len, y: dx / len };
 }
 
-function ensurePeds(state) {
-  if (!Array.isArray(state.peds)) state.peds = [];
-  return state.peds;
-}
-
-// Kota darurat bila main.js memanggil sebelum city siap (sama seperti di
-// vehicles.js, ditulis ulang di sini agar modul ini berdiri sendiri).
-function fallbackCity() {
-  const nodes = [];
-  const edges = [];
-  let id = 0;
-  for (let gx = 0; gx < 5; gx++) {
-    for (let gy = 0; gy < 4; gy++) {
-      nodes.push({ id: id++, x: 320 + gx * 640, y: 300 + gy * 600 });
-    }
-  }
-  const at = (gx, gy) => gy * 5 + gx;
-  for (let gx = 0; gx < 5; gx++) {
-    for (let gy = 0; gy < 4; gy++) {
-      if (gx < 4) edges.push({ a: at(gx, gy), b: at(gx + 1, gy) });
-      if (gy < 3) edges.push({ a: at(gx, gy), b: at(gx, gy + 1) });
-    }
-  }
+function edgePoint(a, b, t, side) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const px = -dy / len;
+  const py = dx / len;
   return {
-    roadGraph: { nodes, edges },
-    isRoad: () => true,
-    collidesBuilding: () => false,
-    pointInWater: () => false,
+    x: a.x + dx * t + px * side * SIDEWALK_OFF,
+    y: a.y + dy * t + py * side * SIDEWALK_OFF,
+    angle: Math.atan2(dy, dx),
+    px, py,
   };
 }
 
-function usableCity(city) {
-  if (city && city.roadGraph && Array.isArray(city.roadGraph.nodes)
-    && city.roadGraph.nodes.length > 0
-    && typeof city.collidesBuilding === 'function') {
-    return city;
-  }
-  return fallbackCity();
-}
-
-function blockedAt(city, x, y, r) {
-  if (x < r || y < r || x > WORLD_W - r || y > WORLD_H - r) return true;
-  if (city.pointInWater && city.pointInWater(x, y)) return true;
-  if (city.collidesBuilding(x, y, r)) return true;
-  return false;
-}
-
-function nodeById(graph, nodeId) {
-  for (const node of graph.nodes) {
-    if (node.id === nodeId) return node;
-  }
-  return graph.nodes[0];
-}
-
-function neighborsOf(graph, nodeId) {
-  const out = [];
-  for (const edge of graph.edges) {
-    if (edge.a === nodeId) out.push(edge.b);
-    else if (edge.b === nodeId) out.push(edge.a);
-  }
-  return out;
-}
-
-function randomEdge(graph) {
-  return graph.edges[Math.floor(Math.random() * graph.edges.length)];
-}
-
-// Posisi pejalan kaki di atas ruas jalan: interpolasi antar node ditambah
-// geseran tegak lurus (trotoar) ke satu sisi yang tetap per pejalan kaki.
-function edgePosition(graph, ped) {
-  const a = nodeById(graph, ped._edge.a);
-  const b = nodeById(graph, ped._edge.b);
-  const t = clamp(ped._t, 0, 1);
-  const mx = a.x + (b.x - a.x) * t;
-  const my = a.y + (b.y - a.y) * t;
-  const along = Math.atan2(b.y - a.y, b.x - a.x);
-  const px = Math.cos(along + Math.PI / 2) * SIDEWALK_OFFSET * ped._side;
-  const py = Math.sin(along + Math.PI / 2) * SIDEWALK_OFFSET * ped._side;
-  return { x: mx + px, y: my + py, angle: along * ped._dir };
-}
-
-function makePed(graph, farFrom) {
-  const edge = randomEdge(graph);
-  const ped = {
-    id: makePedId(),
-    x: 0,
-    y: 0,
-    angle: 0,
-    speed: WALK_SPEED_MIN + Math.random() * (WALK_SPEED_MAX - WALK_SPEED_MIN),
-    state: 'walk',
-    health: PED_HEALTH,
-    color: PED_COLORS[Math.floor(Math.random() * PED_COLORS.length)],
-    _edge: { a: edge.a, b: edge.b },
-    _t: Math.random(),
-    _dir: Math.random() < 0.5 ? 1 : -1,
-    _side: Math.random() < 0.5 ? 1 : -1,
-    _pause: 0,
-    _fleeFrom: null,
-    _fleeTimer: 0,
-    _crimeAt: -999,
-    _downTimer: 0,
-    _seed: Math.random() * Math.PI * 2,
-  };
-  const pos = edgePosition(graph, ped);
-  ped.x = pos.x;
-  ped.y = pos.y;
-  ped.angle = pos.angle;
-  // Jangan muncul tepat di depan hidung pemain.
-  if (farFrom && dist(ped.x, ped.y, farFrom.x, farFrom.y) < RESPAWN_MIN_DIST) {
-    ped._t = 1 - ped._t;
-    const pos2 = edgePosition(graph, ped);
-    ped.x = pos2.x;
-    ped.y = pos2.y;
-  }
+// Fill in every field updatePeds needs; tolerates fallback-spawned peds.
+function ensurePed(ped) {
+  if (typeof ped.speed !== 'number') ped.speed = CFG.PED_SPEED;
+  if (typeof ped.color !== 'string') ped.color = PED_COLORS[0];
+  if (typeof ped.down !== 'boolean') ped.down = false;
+  if (typeof ped.t !== 'number') ped.t = 0;
+  if (typeof ped.side !== 'number') ped.side = 1;
+  if (typeof ped.state !== 'string') ped.state = 'walk';
+  if (typeof ped.fleeTimer !== 'number') ped.fleeTimer = 0;
+  if (typeof ped.waitTimer !== 'number') ped.waitTimer = 0;
+  if (typeof ped.crossT !== 'number') ped.crossT = 0;
+  if (typeof ped.downTimer !== 'number') ped.downTimer = 0;
   return ped;
 }
 
-// -------------------------------------------------------------- spawn peds --
-export function spawnPeds(state, city) {
-  const peds = ensurePeds(state);
-  const liveCity = usableCity(city || state.city);
-  const graph = liveCity.roadGraph;
-  const player = state.player || { x: WORLD_W / 2, y: WORLD_H / 2 };
-  while (peds.length < PED_COUNT) {
-    peds.push(makePed(graph, player));
+/**
+ * Find the road edge under (x, y): the two intersection nodes bracketing
+ * the nearest point on the nearest road, the position along that edge,
+ * and which sidewalk the point is on. Used to put a fleeing pedestrian
+ * back on a sidewalk.
+ */
+function edgeFromRoadPoint(city, x, y) {
+  const near = nearestRoad(city, x, y);
+  if (!near) return null;
+  const yRoads = [...CFG.STREETS, CFG.PROMENADE_Y];
+  if (near.vertical) {
+    const ix = CFG.AVENUES.indexOf(near.x);
+    if (ix < 0) return null;
+    let iy = 0;
+    while (iy < yRoads.length - 2 && y > yRoads[iy + 1]) iy++;
+    const from = city.roadGraph.nodes[iy * CFG.AVENUES.length + ix];
+    const to = city.roadGraph.nodes[(iy + 1) * CFG.AVENUES.length + ix];
+    if (!from || !to) return null;
+    return {
+      from: from.id, to: to.id,
+      t: clamp((y - from.y) / Math.max(1, to.y - from.y), 0, 1),
+      side: x < near.x ? 1 : -1,
+    };
   }
-  return peds;
+  const iy = yRoads.indexOf(near.y);
+  if (iy < 0) return null;
+  let ix = 0;
+  while (ix < CFG.AVENUES.length - 2 && x > CFG.AVENUES[ix + 1]) ix++;
+  const from = city.roadGraph.nodes[iy * CFG.AVENUES.length + ix];
+  const to = city.roadGraph.nodes[iy * CFG.AVENUES.length + ix + 1];
+  if (!from || !to) return null;
+  return {
+    from: from.id, to: to.id,
+    t: clamp((x - from.x) / Math.max(1, to.x - from.x), 0, 1),
+    side: y > near.y ? 1 : -1,
+  };
 }
 
-// ------------------------------------------------------------- perilaku -----
-function startFlee(ped, fromX, fromY) {
-  ped.state = 'flee';
-  ped._fleeFrom = { x: fromX, y: fromY };
-  ped._fleeTimer = FLEE_TIME;
-  ped._pause = 0;
+/** Fill state.peds up to `count` pedestrians walking the sidewalks. */
+export function spawnPeds(state, count = CFG.PED_COUNT) {
+  ensureArrays(state);
+  const city = cityOf(state);
+  const nodes = city.roadGraph.nodes;
+  let added = 0;
+  let guard = 0;
+  while (state.peds.length < count && guard < count * 10 + 10) {
+    guard += 1;
+    const a = nodes[Math.floor(rng.next() * nodes.length)];
+    const options = city.roadGraph.adj.get(a.id) || [];
+    if (options.length === 0) continue;
+    const b = nodes[options[Math.floor(rng.next() * options.length)]];
+    const idle = rng.next() < 0.15;
+    const ped = ensurePed({
+      id: nextPedId(state),
+      x: a.x, y: a.y,
+      angle: Math.atan2(b.y - a.y, b.x - a.x),
+      speed: CFG.PED_SPEED * (0.8 + rng.next() * 0.5),
+      color: PED_COLORS[Math.floor(rng.next() * PED_COLORS.length)],
+      down: false,
+      from: a.id, to: b.id,
+      t: 0.05 + rng.next() * 0.9,
+      side: rng.next() < 0.5 ? 1 : -1,
+      state: idle ? 'idle-sidewalk' : 'walk',
+      waitTimer: idle ? 2 + rng.next() * 4 : 0,
+    });
+    const pt = edgePoint(a, b, ped.t, ped.side);
+    ped.x = pt.x; ped.y = pt.y; ped.angle = pt.angle;
+    // Never spawn on top of a car.
+    let tooClose = false;
+    for (const car of [...state.traffic, ...state.police, ...state.cars]) {
+      if (dist(ped.x, ped.y, car.x, car.y) < 80) { tooClose = true; break; }
+    }
+    if (tooClose) continue;
+    state.peds.push(ped);
+    added += 1;
+  }
+  return added;
 }
 
-// Cari ruas jalan terdekat dari posisi pejalan kaki, lalu tempelkan lagi
-// pejalan kaki ke trotoar ruas itu (dipakai setelah selesai lari).
-function reattachToRoad(graph, ped) {
-  let bestEdge = null;
-  let bestT = 0;
-  let bestD = Infinity;
-  for (const edge of graph.edges) {
-    const a = nodeById(graph, edge.a);
-    const b = nodeById(graph, edge.b);
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
-    const len2 = dx * dx + dy * dy || 1;
-    let t = ((ped.x - a.x) * dx + (ped.y - a.y) * dy) / len2;
-    t = clamp(t, 0, 1);
-    const px = a.x + dx * t;
-    const py = a.y + dy * t;
-    const d = dist(ped.x, ped.y, px, py);
-    if (d < bestD) {
-      bestD = d;
-      bestEdge = edge;
-      bestT = t;
+// A moving car close to an intersection: pedestrians wait instead of
+// stepping into its path. (Parked cars do not count.)
+function carNearNode(state, node) {
+  if (!node) return false;
+  for (const car of [...(state.traffic || []), ...(state.police || [])]) {
+    if (dist(car.x, car.y, node.x, node.y) < 140) return true;
+  }
+  for (const car of state.cars || []) {
+    if (car.isPlayer && Math.abs(car.speed || 0) > 50
+      && dist(car.x, car.y, node.x, node.y) < 140) return true;
+  }
+  return false;
+}
+
+// Where the danger is, if any: a gunshot / hard hit (dangerZone), a fast
+// player car bearing down, or a patrol car closing in while wanted.
+function dangerNear(state, ped) {
+  const dz = state.dangerZone;
+  if (dz && dz.ttl > 0 && dist(ped.x, ped.y, dz.x, dz.y) < dz.radius + 40) {
+    return { x: dz.x, y: dz.y };
+  }
+  const p = state.player;
+  if (p.inCar) {
+    const car = state.cars.find((c) => c.id === p.carId);
+    if (car && Math.abs(car.speed) > 100 && dist(ped.x, ped.y, car.x, car.y) < 70) {
+      return { x: car.x, y: car.y };
     }
   }
-  if (bestEdge) {
-    ped._edge = { a: bestEdge.a, b: bestEdge.b };
-    ped._t = bestT;
-    ped._dir = Math.random() < 0.5 ? 1 : -1;
-  }
-}
-
-function updateWalk(ped, graph, dt) {
-  if (ped._pause > 0) {
-    ped._pause -= dt;
-    ped.speed = 0;
-    return;
-  }
-  const a = nodeById(graph, ped._edge.a);
-  const b = nodeById(graph, ped._edge.b);
-  const len = Math.max(1, dist(a.x, a.y, b.x, b.y));
-  ped._t += (ped._dir * ped.speed * dt) / len;
-  if (ped._t >= 1 || ped._t <= 0) {
-    // Sampai di ujung ruas: belok ke ruas lain dari node itu.
-    const atNode = ped._t >= 1 ? ped._edge.b : ped._edge.a;
-    const options = neighborsOf(graph, atNode)
-      .filter((id) => id !== ped._edge.a && id !== ped._edge.b);
-    if (Math.random() < IDLE_CHANCE) {
-      ped.state = 'idle';
-      ped._pause = IDLE_TIME_MIN
-        + Math.random() * (IDLE_TIME_MAX - IDLE_TIME_MIN);
-      ped._t = clamp(ped._t, 0, 1);
-      return;
-    }
-    if (options.length === 0) {
-      // Jalan buntu: putar balik di ruas yang sama.
-      ped._dir = -ped._dir;
-      ped._t = clamp(ped._t, 0, 1);
-    } else {
-      const next = options[Math.floor(Math.random() * options.length)];
-      ped._edge = { a: atNode, b: next };
-      ped._t = 0;
-      ped._dir = 1;
+  if (state.wanted > 0) {
+    for (const cop of state.police) {
+      if (dist(ped.x, ped.y, cop.x, cop.y) < 90) return { x: cop.x, y: cop.y };
     }
   }
-  const pos = edgePosition(graph, ped);
-  ped.x = pos.x;
-  ped.y = pos.y;
-  ped.angle = pos.angle;
-  if (ped.state === 'idle' && ped._pause <= 0) ped.state = 'walk';
+  return null;
 }
 
-function updateFlee(ped, city, dt) {
-  ped._fleeTimer -= dt;
-  const from = ped._fleeFrom || { x: ped.x, y: ped.y };
-  const away = Math.atan2(ped.y - from.y, ped.x - from.x);
-  ped.angle = away;
-  ped.speed = FLEE_SPEED;
-  const nx = ped.x + Math.cos(away) * FLEE_SPEED * dt;
-  const ny = ped.y + Math.sin(away) * FLEE_SPEED * dt;
-  // Lari tetap menghormati bangunan & air (geser per sumbu).
-  if (!blockedAt(city, nx, ped.y, PED_RADIUS)) ped.x = nx;
-  if (!blockedAt(city, ped.x, ny, PED_RADIUS)) ped.y = ny;
-  ped.x = clamp(ped.x, PED_RADIUS, WORLD_W - PED_RADIUS);
-  ped.y = clamp(ped.y, PED_RADIUS, WORLD_H - PED_RADIUS);
+// Slide a step, never into a building or the water.
+function stepPed(city, ped, nx, ny) {
+  const blocked = (x, y) => collidesBuilding(city, x, y, CFG.PED_RADIUS) || isWater(city, x, y);
+  if (!blocked(nx, ny)) { ped.x = nx; ped.y = ny; return; }
+  // A slide only counts when it actually moves (see vehicles.js).
+  if (nx !== ped.x && !blocked(nx, ped.y)) { ped.x = nx; return; }
+  if (ny !== ped.y && !blocked(ped.x, ny)) { ped.y = ny; }
 }
 
-// Dorong pejalan kaki yang saling bertumpuk supaya tidak berjalan menempel
-// satu sama lain di trotoar yang sama (hanya yang sedang jalan / diam).
-function separatePeds(peds) {
-  for (let i = 0; i < peds.length; i++) {
-    const a = peds[i];
-    if (a.state === 'flee' || a.state === 'down') continue;
-    for (let j = i + 1; j < peds.length; j++) {
-      const b = peds[j];
-      if (b.state === 'flee' || b.state === 'down') continue;
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const d = Math.sqrt(dx * dx + dy * dy);
-      if (d >= 18 || d < 0.01) continue;
-      const push = (18 - d) / 2;
-      const ux = dx / d;
-      const uy = dy / d;
-      a.x -= ux * push;
-      a.y -= uy * push;
-      b.x += ux * push;
-      b.y += uy * push;
-    }
+/**
+ * The main.js step-4 entry point. Pedestrians walk their sidewalk edge;
+ * at an intersection they may cross to the other sidewalk (the only
+ * place crossing happens); they flee from gunfire, hard hits and patrol
+ * cars, then find the nearest sidewalk again; they get up after being
+ * knocked down (unless a mission guard was killed outright).
+ */
+export function updatePeds(state, dt) {
+  ensureArrays(state);
+  if (state.mode !== 'playing') return;
+  const city = cityOf(state);
+  const nodes = city.roadGraph.nodes;
+  spawnPeds(state, CFG.PED_COUNT);
+
+  if (state.dangerZone) {
+    state.dangerZone.ttl -= dt;
+    if (state.dangerZone.ttl <= 0) state.dangerZone = null;
   }
-}
 
-function checkCarThreat(ped, state, now) {
-  const cars = Array.isArray(state.cars) ? state.cars : [];
-  const player = state.player || null;
-  for (const car of cars) {
-    const d = dist(ped.x, ped.y, car.x, car.y);
-    const speed = Math.abs(car.speed || 0);
-    if (d < HIT_DIST && speed > HIT_SPEED) {
-      // Tabrakan hanya dihitung bila pejalan kaki memang ada DI DEPAN
-      // mobil (searah lajunya), bukan saat mobil hanya lewat di samping
-      // trotoar: tanpa ini, mobil yang memotong tikungan di persimpangan
-      // terus-menerus "menyerempet" pejalan kaki dan wanted pemain naik
-      // sendiri padahal pemain diam.
-      const toPed = Math.atan2(ped.y - car.y, ped.x - car.x);
-      let diff = toPed - car.angle;
-      while (diff > Math.PI) diff -= Math.PI * 2;
-      while (diff < -Math.PI) diff += Math.PI * 2;
-      if (Math.abs(diff) >= 0.9) continue;
-      // Tertabrak: terpental ke samping, terluka. Yang jadi KEJAHATAN
-      // (wanted) hanya bila mobilnya mobil pemain — mobil lalu lintas /
-      // polisi yang menabrak bukan salah pemain.
-      const isPlayerCar = !!player && player.onFoot === false && car.id === player.carId;
-      const away = Math.atan2(ped.y - car.y, ped.x - car.x);
-      ped.x += Math.cos(away) * 26;
-      ped.y += Math.sin(away) * 26;
-      ped.health -= HIT_DAMAGE;
-      if (isPlayerCar && now - ped._crimeAt > HIT_CRIME_COOLDOWN) {
-        addWanted(state, 1);
-        ped._crimeAt = now;
+  for (const raw of state.peds) {
+    const ped = ensurePed(raw);
+    // Mission guards stand their post; combat.js fights them.
+    if (ped.missionGuard) continue;
+
+    // Knocked down: lie still, then get up and run.
+    if (ped.down) {
+      if (ped.alive === false) continue; // killed outright, stays down
+      ped.downTimer -= dt;
+      if (ped.downTimer <= 0) {
+        ped.down = false;
+        ped.state = 'flee';
+        ped.fleeTimer = 2.5;
+        ped.fleeX = state.player.x;
+        ped.fleeY = state.player.y;
       }
-      if (ped.health <= 0) {
-        ped.state = 'down';
-        ped._downTimer = DOWN_DESPAWN;
-        ped.speed = 0;
-        // Anggota geng yang tumbang dihitung misi 5 (missions.js membaca
-        // flags.gangKills): pejalan kaki 'down' dihapus setelah beberapa
-        // detik, jadi hitungannya harus menetap di flags, bukan di badan ped.
-        if (ped.gang === true) {
-          if (!state.flags) state.flags = {};
-          state.flags.gangKills = (state.flags.gangKills || 0) + 1;
-        }
-      } else {
-        startFlee(ped, car.x, car.y);
-      }
-      return;
-    }
-    if (d < CAR_SCARE_DIST && speed > CAR_SCARE_SPEED && ped.state !== 'flee') {
-      // Mobil melaju kencang ke arah pejalan kaki: lari sebelum tertabrak.
-      const toPed = Math.atan2(ped.y - car.y, ped.x - car.x);
-      let diff = toPed - car.angle;
-      while (diff > Math.PI) diff -= Math.PI * 2;
-      while (diff < -Math.PI) diff += Math.PI * 2;
-      if (Math.abs(diff) < 0.6) startFlee(ped, car.x, car.y);
-    }
-  }
-}
-
-export function updatePeds(state, dt, city) {
-  if (!state) return;
-  if (!(dt > 0)) return;
-  const peds = ensurePeds(state);
-  const liveCity = usableCity(city || state.city);
-  const graph = liveCity.roadGraph;
-  const now = typeof state.time === 'number' ? state.time : 0;
-
-  // Umur tembakan terakhir menua di sini bila combat.js tidak memajukannya.
-  if (state.flags && typeof state.flags.shotAge === 'number') {
-    state.flags.shotAge += dt;
-  }
-  const shot = state.flags && state.flags.lastShot;
-  const shotAge = state.flags && typeof state.flags.shotAge === 'number'
-    ? state.flags.shotAge : Infinity;
-
-  for (let i = peds.length - 1; i >= 0; i--) {
-    const ped = peds[i];
-    if (ped.state === 'down') {
-      ped._downTimer -= dt;
-      if (ped._downTimer <= 0) peds.splice(i, 1);
       continue;
     }
-    // Tembakan di dekat sini bikin lari.
-    if (shot && shotAge < 1.5 && ped.state !== 'flee') {
-      if (dist(ped.x, ped.y, shot.x, shot.y) < FLEE_RADIUS) {
-        startFlee(ped, shot.x, shot.y);
+
+    // Flee: run away from the danger, then back to the nearest sidewalk.
+    if (ped.state === 'flee' || dangerNear(state, ped)) {
+      if (ped.state !== 'flee') {
+        ped.state = 'flee';
+        ped.fleeTimer = 2.5 + rng.next() * 1.5;
+        const d = dangerNear(state, ped);
+        ped.fleeX = d ? d.x : state.player.x;
+        ped.fleeY = d ? d.y : state.player.y;
       }
+      ped.fleeTimer -= dt;
+      const dx = ped.x - (ped.fleeX ?? ped.x);
+      const dy = ped.y - (ped.fleeY ?? ped.y);
+      const len = Math.hypot(dx, dy) || 1;
+      ped.angle = Math.atan2(dy, dx);
+      stepPed(city, ped, ped.x + (dx / len) * FLEE_SPEED * dt, ped.y + (dy / len) * FLEE_SPEED * dt);
+      if (ped.fleeTimer <= 0) {
+        const edge = edgeFromRoadPoint(city, ped.x, ped.y);
+        if (edge) {
+          ped.from = edge.from; ped.to = edge.to; ped.t = edge.t; ped.side = edge.side;
+          ped.state = 'walk';
+        } else {
+          ped.fleeTimer = 1; // no road nearby yet: keep running a little
+        }
+      }
+      continue;
     }
-    checkCarThreat(ped, state, now);
-    if (ped.state === 'down') continue;
-    if (ped.state === 'flee') {
-      updateFlee(ped, liveCity, dt);
-      if (ped._fleeTimer <= 0) {
+
+    // Standing on the sidewalk: wait a while, then walk on.
+    if (ped.state === 'idle-sidewalk') {
+      ped.waitTimer -= dt;
+      if (ped.waitTimer <= 0) ped.state = 'walk';
+      continue;
+    }
+
+    // Crossing at an intersection: from one sidewalk to the other.
+    if (ped.state === 'cross') {
+      ped.crossT += dt / 1.1;
+      const a = nodes[ped.from];
+      const b = nodes[ped.to];
+      if (!a || !b) { ped.state = 'walk'; ped.crossT = 0; continue; }
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const perp = perpOf(dx, dy, len);
+      const k = clamp(ped.crossT, 0, 1);
+      const off = (1 - k) * ped.side * SIDEWALK_OFF + k * -ped.side * SIDEWALK_OFF;
+      ped.x = a.x + perp.x * off;
+      ped.y = a.y + perp.y * off;
+      ped.angle = Math.atan2(perp.y, perp.x);
+      if (ped.crossT >= 1) {
+        ped.side = -ped.side;
         ped.state = 'walk';
-        ped._fleeFrom = null;
-        reattachToRoad(graph, ped);
+        ped.crossT = 0;
       }
-    } else {
-      if (typeof ped.speed !== 'number' || ped.speed <= 0) {
-        ped.speed = WALK_SPEED_MIN
-          + Math.random() * (WALK_SPEED_MAX - WALK_SPEED_MIN);
+      continue;
+    }
+
+    // Walking: advance along the sidewalk edge; at the intersection pick
+    // the next edge, and sometimes cross to the other sidewalk first.
+    const a = nodes[ped.from];
+    const b = nodes[ped.to];
+    if (!a || !b || ped.from === ped.to) {
+      const edge = edgeFromRoadPoint(city, ped.x, ped.y);
+      if (edge) {
+        ped.from = edge.from; ped.to = edge.to; ped.t = edge.t; ped.side = edge.side;
+      } else {
+        ped.t = 0;
       }
-      updateWalk(ped, graph, dt);
+      continue;
+    }
+    const segLen = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+    ped.t += (ped.speed * dt) / segLen;
+    if (ped.t >= 1) {
+      const arrived = ped.to;
+      const cameFrom = ped.from;
+      const options = (city.roadGraph.adj.get(arrived) || []).filter((id) => id !== cameFrom);
+      ped.from = arrived;
+      if (options.length === 0) {
+        ped.to = cameFrom; // no onward edge: turn back along the same edge
+      } else {
+        ped.to = options[Math.floor(rng.next() * options.length)];
+      }
+      ped.t = 0;
+      if (rng.next() < 0.3 && !carNearNode(state, nodes[arrived])) {
+        // Cross here, at the intersection, to the other sidewalk —
+        // but only when no car is bearing down on the crossing.
+        ped.state = 'cross';
+        ped.crossT = 0;
+        ped.crossFrom = ped.from;
+        ped.crossTo = ped.to;
+      }
+      continue;
+    }
+    const pt = edgePoint(a, b, ped.t, ped.side);
+    ped.x = pt.x; ped.y = pt.y; ped.angle = pt.angle;
+  }
+
+  // Separation: pedestrians keep a little personal space.
+  const walkers = state.peds.filter((p) => !p.down && !p.missionGuard);
+  for (let i = 0; i < walkers.length; i++) {
+    for (let j = i + 1; j < walkers.length; j++) {
+      const a = walkers[i];
+      const b = walkers[j];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const d = Math.hypot(dx, dy);
+      if (d >= 16 || d < 0.01) continue;
+      const push = (16 - d) / 2;
+      const nx = dx / d;
+      const ny = dy / d;
+      a.x -= nx * push; a.y -= ny * push;
+      b.x += nx * push; b.y += ny * push;
     }
   }
 
-  // Jaga jumlah pejalan kaki tetap hidup: respawn yang hilang jauh dari pemain.
-  if (peds.length < PED_COUNT) {
-    const player = state.player || { x: WORLD_W / 2, y: WORLD_H / 2 };
-    peds.push(makePed(graph, player));
+  // Last resort: a car must never sit on top of a pedestrian. Push the
+  // pedestrian away from the car until clear (traffic itself already
+  // stops for anyone in its path; this only fires if something slipped
+  // through, e.g. a pedestrian walking into a car that stopped for them).
+  for (const ped of walkers) {
+    for (const car of [...state.traffic, ...state.police]) {
+      if (dist(ped.x, ped.y, car.x, car.y) >= 26) continue;
+      const dx = ped.x - car.x;
+      const dy = ped.y - car.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const tries = [
+        { x: dx / len, y: dy / len },
+        { x: -dy / len, y: dx / len },
+        { x: dy / len, y: -dx / len },
+        { x: -dx / len, y: -dy / len },
+      ];
+      for (const dir of tries) {
+        const nx = car.x + dir.x * 32;
+        const ny = car.y + dir.y * 32;
+        if (!collidesBuilding(city, nx, ny, CFG.PED_RADIUS) && !isWater(city, nx, ny)) {
+          ped.x = nx; ped.y = ny;
+          break;
+        }
+      }
+      car.speed = 0;
+      break;
+    }
+    const c = clampToWorld(ped.x, ped.y, CFG.PED_RADIUS);
+    ped.x = c.x; ped.y = c.y;
   }
-
-  separatePeds(peds);
 }

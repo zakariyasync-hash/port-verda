@@ -1,316 +1,318 @@
-// audio.js — Port Verda: semua suara lewat WebAudio, tanpa file audio.
+// audio.js — Port Verda sound, pure WebAudio (Builder B3).
 //
-// Prinsip: tidak ada jaringan, tidak ada aset. Setiap bunyi dibuat dari
-// oscillator / noise buffer yang dibuat di tempat. initAudio() HARUS
-// dipanggil dari dalam gesture pengguna (klik / tekan tombol) karena
-// browser memblokir AudioContext sebelum itu. Semua fungsi lain aman
-// dipanggil sebelum init — mereka diam-diam tidak melakukan apa-apa.
+// Written from scratch in this session. No audio files, no network, no library.
+// Every sound is synthesized with oscillators / filtered noise at call time.
+// Safe in headless Chromium (AudioContext may be suspended or absent) and in
+// Node (no window/AudioContext): every public function no-ops instead of
+// throwing when audio is unavailable.
 //
-// Bunyi yang tersedia lewat playSound(name):
-//   'shoot'   — letupan noise pendek (tembakan)
-//   'punch'   — debuk rendah (pukulan)
-//   'pickup'  — blip naik dua nada (ambil item / paket)
-//   'mission' — jingle tiga nada (misi selesai)
-//   'fail'    — dua nada turun (misi gagal)
-//   'siren'   — dua nada bergantian, sekali jalan (dipakai polisi / updateEngine)
-//   'click'   — klik menu pendek
-//   'start'   — arpeggio naik saat permainan dimulai (dipanggil main.js)
-//   'busted'  — dua nada sirene turun (ditangkap polisi, dipanggil main.js)
-//   'wasted'  — nada rendah turun panjang (tumbang, dipanggil main.js)
-// updateEngine(state) mengurus dua bunyi kontinu: mesin mobil (frekuensi
-// ikut kecepatan) dan sirene (hidup saat wanted > 0).
+// Lifecycle (main.js B1): call initAudio() once from the first user gesture
+// (Enter/click on the title screen), then call updateAudio(state, dt) every
+// frame — it drives the engine hum from speed and the siren from wanted level.
+// toggleMute() (M key) flips state.muted and the master gain.
 
-let audioCtx = null;
-let masterGain = null;
-let noiseBuffer = null;
-let muted = false;
-
-// Bunyi kontinu: mesin.
+let ctx = null;
+let master = null;
 let engineOsc = null;
 let engineOsc2 = null;
 let engineGain = null;
-let engineFilter = null;
-
-// Bunyi kontinu: sirene.
 let sirenOsc = null;
 let sirenGain = null;
-let sirenHigh = false;
-let sirenTimerId = null;
+let sirenLfo = null;
+let muted = false;
+let started = false;
 
-function audioSupported() {
-  return (
-    typeof window !== 'undefined' &&
-    (typeof window.AudioContext === 'function' || typeof window.webkitAudioContext === 'function')
-  );
+function audioContextClass() {
+  if (typeof window === 'undefined') return null;
+  return window.AudioContext || window.webkitAudioContext || null;
 }
 
-export function initAudio() {
-  if (audioCtx) {
-    if (audioCtx.state === 'suspended') {
-      audioCtx.resume().catch(() => {});
-    }
-    return audioCtx;
-  }
-  if (!audioSupported()) return null;
-  try {
-    const Ctor = window.AudioContext || window.webkitAudioContext;
-    audioCtx = new Ctor();
-    masterGain = audioCtx.createGain();
-    masterGain.gain.value = muted ? 0 : 0.9;
-    masterGain.connect(audioCtx.destination);
-    // Buffer noise putih sepanjang 1 detik, dipakai ulang oleh 'shoot'.
-    const length = Math.floor(audioCtx.sampleRate * 1);
-    noiseBuffer = audioCtx.createBuffer(1, length, audioCtx.sampleRate);
-    const data = noiseBuffer.getChannelData(0);
-    for (let i = 0; i < length; i += 1) data[i] = Math.random() * 2 - 1;
-    if (audioCtx.state === 'suspended') {
-      audioCtx.resume().catch(() => {});
-    }
-  } catch (err) {
-    audioCtx = null;
-    masterGain = null;
-    noiseBuffer = null;
-  }
-  return audioCtx;
+export function isAudioReady() {
+  return ctx !== null && ctx.state === 'running';
 }
 
 export function isMuted() {
   return muted;
 }
 
-export function setMuted(m) {
-  muted = m === true;
-  if (masterGain && audioCtx) {
-    masterGain.gain.setTargetAtTime(muted ? 0 : 0.9, audioCtx.currentTime, 0.02);
+/** Create the AudioContext + master gain. Call from a user gesture. */
+export function initAudio() {
+  if (ctx) {
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    return true;
   }
-  if (muted) {
-    stopEngineSound();
-    stopSirenSound();
+  const AC = audioContextClass();
+  if (!AC) return false;
+  try {
+    ctx = new AC();
+    master = ctx.createGain();
+    master.gain.value = muted ? 0 : 0.5;
+    master.connect(ctx.destination);
+    started = true;
+    startEngine();
+    startSiren();
+    return true;
+  } catch {
+    ctx = null;
+    return false;
   }
+}
+
+function startEngine() {
+  if (!ctx || engineOsc) return;
+  try {
+    engineOsc = ctx.createOscillator();
+    engineOsc.type = 'sawtooth';
+    engineOsc.frequency.value = 50;
+    engineOsc2 = ctx.createOscillator();
+    engineOsc2.type = 'square';
+    engineOsc2.frequency.value = 25;
+    engineGain = ctx.createGain();
+    engineGain.gain.value = 0;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 420;
+    engineOsc.connect(filter);
+    engineOsc2.connect(filter);
+    filter.connect(engineGain);
+    engineGain.connect(master);
+    engineOsc.start();
+    engineOsc2.start();
+  } catch {
+    engineOsc = null;
+  }
+}
+
+function startSiren() {
+  if (!ctx || sirenOsc) return;
+  try {
+    sirenOsc = ctx.createOscillator();
+    sirenOsc.type = 'sine';
+    sirenOsc.frequency.value = 700;
+    sirenLfo = ctx.createOscillator();
+    sirenLfo.type = 'square';
+    sirenLfo.frequency.value = 0.6;
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.value = 220;
+    sirenLfo.connect(lfoGain);
+    lfoGain.connect(sirenOsc.frequency);
+    sirenGain = ctx.createGain();
+    sirenGain.gain.value = 0;
+    sirenOsc.connect(sirenGain);
+    sirenGain.connect(master);
+    sirenOsc.start();
+    sirenLfo.start();
+  } catch {
+    sirenOsc = null;
+  }
+}
+
+/** Engine hum follows speed; call every frame with the live state. */
+export function updateEngine(state) {
+  if (!ctx || !engineOsc || !engineGain) return;
+  try {
+    const pl = (state && state.player) || {};
+    // Speed lives on the player on foot; in a car it lives on the car
+    // (B2: render.js reads car.speed). Prefer the car when driving.
+    let speed = Math.abs(pl.speed ?? 0);
+    if (pl.inCar && Array.isArray(state.cars)) {
+      const car = state.cars.find((c) => c && c.id === pl.carId);
+      if (car && typeof car.speed === 'number') speed = Math.abs(car.speed);
+    }
+    const inCar = !!pl.inCar;
+    const t = ctx.currentTime;
+    const targetGain = inCar ? 0.05 + Math.min(0.12, speed / 4000) : 0;
+    engineGain.gain.setTargetAtTime(targetGain, t, 0.08);
+    const freq = 45 + Math.min(160, speed * 0.35);
+    engineOsc.frequency.setTargetAtTime(freq, t, 0.08);
+    engineOsc2.frequency.setTargetAtTime(freq / 2, t, 0.08);
+  } catch {
+    // Headless/suspended context: stay silent, never throw.
+  }
+}
+
+/** Police siren audible while wanted > 0. Call every frame. */
+export function updateSiren(state) {
+  if (!ctx || !sirenGain) return;
+  try {
+    const wanted = (state && state.wanted) || 0;
+    const t = ctx.currentTime;
+    const target = wanted > 0 ? 0.045 + Math.min(0.05, wanted * 0.01) : 0;
+    sirenGain.gain.setTargetAtTime(target, t, 0.2);
+  } catch {
+    // Silent fallback.
+  }
+}
+
+/** One frame of audio updates: engine + siren. */
+export function updateAudio(state) {
+  if (!ctx) return;
+  updateEngine(state);
+  updateSiren(state);
+}
+
+function tone({ type = 'sine', from = 440, to = null, dur = 0.15, vol = 0.2, when = 0 }) {
+  if (!ctx || !master) return;
+  try {
+    const t0 = ctx.currentTime + when;
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(from, t0);
+    if (to !== null) osc.frequency.exponentialRampToValueAtTime(Math.max(1, to), t0 + dur);
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(g);
+    g.connect(master);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+  } catch {
+    // Silent fallback.
+  }
+}
+
+function noiseBurst({ dur = 0.12, vol = 0.3, freq = 1200 }) {
+  if (!ctx || !master) return;
+  try {
+    const len = Math.max(1, Math.floor(ctx.sampleRate * dur));
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < len; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = freq;
+    const g = ctx.createGain();
+    g.gain.value = vol;
+    src.connect(filter);
+    filter.connect(g);
+    g.connect(master);
+    src.start();
+  } catch {
+    // Silent fallback.
+  }
+}
+
+export function playShot() {
+  noiseBurst({ dur: 0.1, vol: 0.35, freq: 1800 });
+  tone({ type: 'square', from: 220, to: 60, dur: 0.08, vol: 0.12 });
+}
+
+export function playPunch() {
+  noiseBurst({ dur: 0.08, vol: 0.25, freq: 300 });
+  tone({ type: 'sine', from: 140, to: 70, dur: 0.09, vol: 0.2 });
+}
+
+export function playPickup() {
+  tone({ type: 'sine', from: 660, to: 990, dur: 0.12, vol: 0.2 });
+}
+
+export function playClick() {
+  tone({ type: 'square', from: 800, to: 800, dur: 0.04, vol: 0.08 });
+}
+
+export function playMissionComplete() {
+  // Rising major arpeggio: C5 E5 G5 C6.
+  const notes = [523.25, 659.25, 783.99, 1046.5];
+  notes.forEach((f, i) => tone({ type: 'triangle', from: f, dur: 0.22, vol: 0.22, when: i * 0.11 }));
+}
+
+export function playMissionFailed() {
+  // Descending minor: A4 F4 D4.
+  const notes = [440, 349.23, 293.66];
+  notes.forEach((f, i) => tone({ type: 'sawtooth', from: f, dur: 0.25, vol: 0.14, when: i * 0.14 }));
+}
+
+export function playBusted() {
+  tone({ type: 'sawtooth', from: 330, to: 110, dur: 0.7, vol: 0.2 });
+  tone({ type: 'sine', from: 220, to: 55, dur: 0.8, vol: 0.18, when: 0.1 });
+}
+
+export function playWasted() {
+  tone({ type: 'sawtooth', from: 220, to: 55, dur: 0.9, vol: 0.2 });
+}
+
+export function playEngineStart() {
+  tone({ type: 'sawtooth', from: 40, to: 90, dur: 0.35, vol: 0.12 });
+}
+
+/** Flip mute; also mirrors onto state.muted when a state is passed. */
+export function toggleMute(state) {
+  muted = !muted;
+  if (master && ctx) {
+    try {
+      master.gain.setTargetAtTime(muted ? 0 : 0.5, ctx.currentTime, 0.05);
+    } catch {
+      // Silent fallback.
+    }
+  }
+  if (state) state.muted = muted;
   return muted;
 }
 
-// --- Pembangun bunyi sekali jalan -------------------------------------------
-
-function tone(freq, duration, type, volume, when, slideTo) {
-  if (!audioCtx || !masterGain) return;
-  const t0 = audioCtx.currentTime + (when || 0);
-  const osc = audioCtx.createOscillator();
-  const gain = audioCtx.createGain();
-  osc.type = type || 'sine';
-  osc.frequency.setValueAtTime(freq, t0);
-  if (slideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(1, slideTo), t0 + duration);
-  gain.gain.setValueAtTime(0.0001, t0);
-  gain.gain.exponentialRampToValueAtTime(volume || 0.2, t0 + 0.01);
-  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
-  osc.connect(gain);
-  gain.connect(masterGain);
-  osc.start(t0);
-  osc.stop(t0 + duration + 0.05);
-}
-
-function noiseBurst(duration, volume, filterFreq) {
-  if (!audioCtx || !masterGain || !noiseBuffer) return;
-  const t0 = audioCtx.currentTime;
-  const src = audioCtx.createBufferSource();
-  src.buffer = noiseBuffer;
-  src.loop = true;
-  const filter = audioCtx.createBiquadFilter();
-  filter.type = 'lowpass';
-  filter.frequency.value = filterFreq || 1800;
-  const gain = audioCtx.createGain();
-  gain.gain.setValueAtTime(volume || 0.35, t0);
-  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
-  src.connect(filter);
-  filter.connect(gain);
-  gain.connect(masterGain);
-  src.start(t0);
-  src.stop(t0 + duration + 0.05);
-}
-
-export function playSound(name) {
-  if (!audioCtx || muted) return;
-  // main.js memanggil playSound('start') tepat dari gesture Enter; bila
-  // context masih tersuspensi, coba bangunkan supaya jingle terdengar.
-  if (audioCtx.state === 'suspended') {
-    audioCtx.resume().catch(() => {});
-  }
-  try {
-    switch (name) {
-      case 'shoot':
-        noiseBurst(0.14, 0.4, 2400);
-        tone(180, 0.08, 'square', 0.12, 0, 60);
-        break;
-      case 'punch':
-        tone(110, 0.14, 'sine', 0.5, 0, 45);
-        noiseBurst(0.07, 0.18, 700);
-        break;
-      case 'pickup':
-        tone(660, 0.09, 'sine', 0.22);
-        tone(880, 0.12, 'sine', 0.22, 0.09);
-        break;
-      case 'mission':
-        tone(523, 0.14, 'triangle', 0.28);
-        tone(659, 0.14, 'triangle', 0.28, 0.13);
-        tone(784, 0.26, 'triangle', 0.3, 0.26);
-        break;
-      case 'fail':
-        tone(392, 0.18, 'sawtooth', 0.16);
-        tone(294, 0.3, 'sawtooth', 0.16, 0.17);
-        break;
-      case 'siren':
-        tone(720, 0.22, 'square', 0.07);
-        tone(960, 0.22, 'square', 0.07, 0.22);
-        tone(720, 0.22, 'square', 0.07, 0.44);
-        tone(960, 0.22, 'square', 0.07, 0.66);
-        break;
-      case 'click':
-        tone(1200, 0.05, 'sine', 0.15);
-        break;
-      case 'start':
-        tone(392, 0.1, 'triangle', 0.25);
-        tone(523, 0.1, 'triangle', 0.25, 0.09);
-        tone(659, 0.18, 'triangle', 0.28, 0.18);
-        break;
-      case 'busted':
-        tone(960, 0.2, 'square', 0.07);
-        tone(720, 0.2, 'square', 0.07, 0.2);
-        tone(960, 0.2, 'square', 0.07, 0.4);
-        tone(620, 0.4, 'square', 0.07, 0.6);
-        break;
-      case 'wasted':
-        tone(220, 0.35, 'sawtooth', 0.18, 0, 110);
-        tone(110, 0.6, 'sawtooth', 0.18, 0.3, 55);
-        break;
-      default:
-        break;
+export function setMuted(value, state) {
+  muted = !!value;
+  if (master && ctx) {
+    try {
+      master.gain.setTargetAtTime(muted ? 0 : 0.5, ctx.currentTime, 0.05);
+    } catch {
+      // Silent fallback.
     }
-  } catch (err) {
-    // Suara tidak boleh mematikan game: abaikan kegagalan audio.
   }
+  if (state) state.muted = muted;
+  return muted;
 }
 
-// --- Bunyi kontinu: mesin ---------------------------------------------------
-
-function startEngineSound() {
-  if (!audioCtx || !masterGain || engineOsc) return;
-  try {
-    engineOsc = audioCtx.createOscillator();
-    engineOsc.type = 'sawtooth';
-    engineOsc.frequency.value = 55;
-    engineOsc2 = audioCtx.createOscillator();
-    engineOsc2.type = 'square';
-    engineOsc2.frequency.value = 28;
-    engineFilter = audioCtx.createBiquadFilter();
-    engineFilter.type = 'lowpass';
-    engineFilter.frequency.value = 420;
-    engineGain = audioCtx.createGain();
-    engineGain.gain.value = 0;
-    engineOsc.connect(engineFilter);
-    engineOsc2.connect(engineFilter);
-    engineFilter.connect(engineGain);
-    engineGain.connect(masterGain);
-    engineOsc.start();
-    engineOsc2.start();
-  } catch (err) {
-    engineOsc = null;
-    engineOsc2 = null;
-    engineGain = null;
-    engineFilter = null;
-  }
+/**
+ * The createAudio(state) object main.js expects. Lazily starts the shared
+ * AudioContext on first use (a user gesture has usually happened by then)
+ * and maps main.js's one-word sound names onto the players above. Audio
+ * never throws and never breaks gameplay: every call is guarded.
+ */
+export function createAudio(state) {
+  const players = {
+    punch: playPunch,
+    shoot: playShot,
+    shot: playShot,
+    mission: playMissionComplete,
+    pickup: playPickup,
+    click: playClick,
+    busted: playBusted,
+    wasted: playWasted,
+    hit: playPunch,
+  };
+  return {
+    play(name) {
+      if (state && state.muted) return;
+      try { initAudio(); } catch { /* silent */ }
+      const fn = players[name];
+      if (typeof fn === 'function') {
+        try { fn(); } catch { /* silent */ }
+      }
+    },
+    setMuted(value) { setMuted(value, state); },
+    update(s) { updateAudio(s || state); },
+  };
 }
 
-function stopEngineSound() {
+/** For tests: reset module singletons (only meaningful in Node/headless). */
+export function __resetAudioForTest() {
   try {
-    if (engineOsc) engineOsc.stop();
-  } catch (err) {}
-  try {
-    if (engineOsc2) engineOsc2.stop();
-  } catch (err) {}
+    if (ctx && typeof ctx.close === 'function') ctx.close().catch(() => {});
+  } catch {
+    // Ignore.
+  }
+  ctx = null;
+  master = null;
   engineOsc = null;
   engineOsc2 = null;
   engineGain = null;
-  engineFilter = null;
-}
-
-// --- Bunyi kontinu: sirene --------------------------------------------------
-
-function startSirenSound() {
-  if (!audioCtx || !masterGain || sirenOsc) return;
-  try {
-    sirenOsc = audioCtx.createOscillator();
-    sirenOsc.type = 'square';
-    sirenOsc.frequency.value = 720;
-    sirenGain = audioCtx.createGain();
-    sirenGain.gain.value = 0.045;
-    sirenOsc.connect(sirenGain);
-    sirenGain.connect(masterGain);
-    sirenOsc.start();
-    sirenHigh = false;
-    sirenTimerId = setInterval(() => {
-      if (!sirenOsc || !audioCtx) return;
-      sirenHigh = !sirenHigh;
-      sirenOsc.frequency.setTargetAtTime(sirenHigh ? 960 : 720, audioCtx.currentTime, 0.03);
-    }, 450);
-  } catch (err) {
-    sirenOsc = null;
-    sirenGain = null;
-  }
-}
-
-function stopSirenSound() {
-  if (sirenTimerId !== null) {
-    clearInterval(sirenTimerId);
-    sirenTimerId = null;
-  }
-  try {
-    if (sirenOsc) sirenOsc.stop();
-  } catch (err) {}
   sirenOsc = null;
   sirenGain = null;
+  sirenLfo = null;
+  muted = false;
+  started = false;
 }
 
-// --- Update tiap frame ------------------------------------------------------
-// Dipanggil main.js setiap frame dengan state penuh. Mengatur mesin (ikut
-// kecepatan mobil) dan sirene (ikut wanted). Aman sebelum initAudio().
-export function updateEngine(state) {
-  if (!audioCtx || muted) {
-    if (muted) {
-      stopEngineSound();
-      stopSirenSound();
-    }
-    return;
-  }
-  // Browser menahan AudioContext dalam keadaan 'suspended' sampai ada
-  // gesture pengguna. main.js memanggil initAudio() dari gesture, tapi
-  // bila context sempat tersuspensi lagi, coba bangunkan di sini.
-  if (audioCtx.state === 'suspended') {
-    audioCtx.resume().catch(() => {});
-  }
-  try {
-    const player = (state && state.player) || {};
-    const driving = player.onFoot === false && typeof player.speed === 'number';
-    const speed = Math.abs(player.speed || 0);
-
-    if (driving) {
-      startEngineSound();
-      if (engineOsc && engineGain && audioCtx) {
-        const t = audioCtx.currentTime;
-        // 55 Hz diam -> ~220 Hz pada kecepatan penuh (diasumsikan ~600 px/dtk).
-        const freq = 55 + Math.min(1, speed / 600) * 165;
-        engineOsc.frequency.setTargetAtTime(freq, t, 0.08);
-        engineOsc2.frequency.setTargetAtTime(freq / 2, t, 0.08);
-        engineFilter.frequency.setTargetAtTime(350 + Math.min(1, speed / 600) * 900, t, 0.1);
-        engineGain.gain.setTargetAtTime(0.05 + Math.min(1, speed / 600) * 0.045, t, 0.1);
-      }
-    } else if (engineGain && audioCtx) {
-      engineGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
-    }
-
-    const wanted = state && typeof state.wanted === 'number' ? state.wanted : 0;
-    if (wanted > 0) startSirenSound();
-    else stopSirenSound();
-  } catch (err) {
-    // Suara tidak boleh mematikan game.
-  }
-}
+export { started as audioStarted };

@@ -1,694 +1,738 @@
-// missions.js — Port Verda: daftar misi cerita + side job dan mesin progresinya.
+// missions.js — Port Verda story missions + side jobs (Builder B3).
 //
-// Modul ini HANYA mengurus data dan logika misi: memulai misi, memeriksa
-// syarat selesai / gagal setiap frame, memberi reward, dan membuka misi
-// berikutnya. Modul ini tidak menggambar apa pun dan tidak memutar suara:
-// penyelesaian / kegagalan dilaporkan lewat nilai kembalian updateMissions
-// dan lewat state.flags, supaya main.js yang memutuskan efek lanjutannya
-// (jingle, popup, dan sebagainya).
+// Written from scratch in this session. No library, no network, no external asset.
+// Pure game logic: no DOM, no canvas, no AudioContext here, so it can be unit-tested
+// in plain Node. The only side effects are writes onto the shared `state` object.
 //
-// Kontrak state yang dipakai di sini:
-//   state.player  { x, y, ... }
-//   state.money   number
-//   state.health  number
-//   state.wanted  number (0..5)
-//   state.cars    array mobil { id, model, isTarget, health, wrecked, ... }
-//   state.peds    array pejalan kaki { gang, dead, health, ... }
-//   state.city    objek kota B1 bila ada (dipakai untuk city.spawns.missionSpots)
-//   state.missions { current, list, active }
-//   state.flags   objek bebas untuk penanda antar modul
+// STATE CONTRACT (agreed with B1/B2; aligned to B1's config.js / city.js /
+// render.js / save.js as committed in this repo):
+//   state = { mode, time, money, health, wanted, player:{x,y,angle,speed,onFoot,inCar,carId},
+//             cars:[], traffic:[], peds:[], police:[], fx:[], toast:{text,ttl}|null,
+//             city, missions:{activeId, active, target, done:[], progress:{}},
+//             camera:{x,y}, input, muted }
+//   state.time is elapsed minutes since 08:00 (render.js clock: 08:00 + state.time).
+//   state.camera is the TOP-LEFT corner of the viewport (render.js drawWorld
+//   translates by -cam.x/-cam.y). state.city is buildCity() from city.js.
+//   state.missions.activeId is the running mission (save.js stores it);
+//   state.missions.active = {id, name, objective} and state.missions.target =
+//   {x, y, label} are the fields render.js reads every frame — this module
+//   keeps them in sync, so the minimap blip, world beacon and top-centre
+//   mission banner always show the live objective.
+//
+// WORLD CONTRACT (B1 city.js): world 2560 x 1920. Avenues x in
+// [160,420,680,940,1200,1460,1720,1980,2240]; streets y in
+// [140,380,620,860,1100,1340,1560]; promenade y=1680; water y>=1740.
+// Districts (city.js districtAt): oldtown x<940,y<860; downtown x 940-1720,
+// y<1340 (and market x>=1720,y<860); industrial x<940,y 860-1340;
+// hills x>=1720,y 860-1340; harbor y>=1340.
+// Key spots come from city.spawns.missionSpots when state.city exists
+// (B1's data wins); LOCATIONS below are the same points as defaults, so the
+// missions also work in Node tests without a city.
+//
+// Mission flow: story missions run in order m1 -> m6. Side jobs (taxi, courier)
+// can be taken any time no story/side mission is active, and are repeatable.
+// Every mission is playable end to end through real gameplay: reach a marker,
+// carry a package, keep wanted low, evade police, steal and deliver a car,
+// defeat guards, ram a fleeing truck. Completion/failure is checked every frame
+// by updateMissions(state, dt); it returns an event object when something
+// resolves, or null. main.js should play the matching jingle (audio.js) on it.
 
-export const WORLD_W = 3200;
-export const WORLD_H = 2400;
+import { CFG } from './config.js';
 
-// Jarak (piksel dunia) yang dianggap "sampai" di titik target misi.
-export const ARRIVE_RADIUS = 75;
+export const WORLD = { width: 2560, height: 1920 };
 
-// Titik-titik penting di peta Port Verda. Koordinat ini mengikuti kota B1
-// (city.js): jalan-jalan berada di kelipatan 200 px, air mulai y=2100,
-// dermaga di (600,1900). Titik yang punya padanan di
-// city.spawns.missionSpots memakai koordinat B1 (lihat SPOT_ALIASES);
-// sisanya diletakkan TEPAT di persimpangan jalan (kelipatan 200) supaya
-// selalu bisa dicapai jalan kaki / mobil dan tidak jatuh di dalam gedung
-// atau di air. B4 HARUS memverifikasi ulang bila city.js berubah.
-export const MISSION_SPOTS = {
-  depot: { x: 1000, y: 1700 }, // markas kurir Raka = spot 'mira' B1
-  market: { x: 1400, y: 1500 }, // kios Pasar Verda = spot 'market' B1
-  warehouseEast: { x: 2700, y: 1200 }, // gudang timur = spot 'industrial' B1
-  downtown: { x: 1700, y: 1000 }, // alun-alun Downtown = spot 'downtown' B1
-  oldTown: { x: 600, y: 1600 }, // gang Kota Tua (persimpangan jalan)
-  pier: { x: 600, y: 1900 }, // dermaga selatan = spot 'harbor' B1
-  garage: { x: 2400, y: 1000 }, // Bengkel Darto (persimpangan jalan)
-  hills: { x: 2500, y: 400 }, // perumahan Bukit = spot 'hills' B1
-  harborGate: { x: 1200, y: 1800 }, // terminal penumpang (jalan tepi dermaga)
-  targetCar: { x: 2000, y: 1200 }, // tempat parkir bukit (persimpangan jalan)
+export const DISTRICTS = {
+  oldtown:    { x: 0,    y: 0,    w: 940,  h: 860,  label: 'Old Town' },
+  downtown:   { x: 940,  y: 0,    w: 780,  h: 1340, label: 'Downtown' },
+  market:     { x: 1720, y: 0,    w: 840,  h: 860,  label: 'Market' },
+  industrial: { x: 0,    y: 860,  w: 940,  h: 480,  label: 'Industrial' },
+  hills:      { x: 1720, y: 860,  w: 840,  h: 480,  label: 'Hills' },
+  harbor:     { x: 0,    y: 1340, w: 2560, h: 580,  label: 'Harbor' },
 };
 
-// Nama spot lokal -> nama spot di city.spawns.missionSpots (B1). Bila kota
-// menyediakan titik bernama itu, koordinat B1 yang dipakai.
-export const SPOT_ALIASES = {
-  depot: 'mira',
-  warehouseEast: 'industrial',
-  pier: 'harbor',
+// Default key locations (world px), all on or next to a road in the right
+// district. Overridden by state.city.spawns.missionSpots when present.
+export const LOCATIONS = {
+  dockPickup:    { x: 320,  y: 1700, district: 'harbor',     label: 'Dermaga 3' },
+  miraBase:      { x: 560,  y: 1680, district: 'harbor',     label: 'Markas Mira' },
+  marketShop:    { x: 1980, y: 620,  district: 'market',     label: 'Pasar Ikan' },
+  industrialDrop:{ x: 420,  y: 1100, district: 'industrial', label: 'Gudang Industrial' },
+  downtownSport: { x: 1200, y: 380,  district: 'downtown',   label: 'Menara Kembar' },
+  industrialGarage: { x: 680,  y: 1100, district: 'industrial', label: 'Bengkel Tua' },
+  warehouse:     { x: 420,  y: 1560, district: 'harbor',     label: 'Gudang 7' },
+  truckStart:    { x: 320,  y: 1700, district: 'harbor',     label: 'Dermaga 3' },
+  hillsExit:     { x: 2540, y: 1100, district: 'hills',      label: 'Pintu Keluar Hills' },
+  taxiStandA:    { x: 1980, y: 620,  district: 'market',     label: 'Pasar Ikan' },
+  taxiStandB:    { x: 1200, y: 380,  district: 'downtown',   label: 'Menara Kembar' },
+  taxiStandC:    { x: 680,  y: 1100, district: 'industrial', label: 'Bengkel Tua' },
+  taxiStandD:    { x: 2240, y: 1100, district: 'hills',      label: 'Bukit Perumahan' },
 };
 
-// ---------------------------------------------------------------------------
-// Definisi misi
-// ---------------------------------------------------------------------------
-// Tiap entri: id, kind ('story' | 'side'), title, brief, objective, reward,
-// spot (nama titik di MISSION_SPOTS), target (salinan koordinat spot),
-// state ('locked' | 'active' | 'done' | 'failed'), plus field khusus:
-//   timeLimit   detik (misi berwaktu)
-//   points      daftar nama spot berurutan (misi multi-titik)
-//   targetCarId / targetCarModel  (misi curi mobil)
-// Field runtime (diisi startMission): phase, elapsed, timer, progress.
+// Which B1 missionSpots id each location maps to (city.js spawns).
+const SPOT_IDS = {
+  dockPickup: 'dermaga',
+  marketShop: 'pasar',
+  warehouse: 'gudang',
+  downtownSport: 'menara',
+  industrialGarage: 'bengkel',
+  truckStart: 'dermaga',
+  taxiStandA: 'pasar',
+  taxiStandB: 'menara',
+  taxiStandC: 'bengkel',
+  taxiStandD: 'bukit',
+};
 
-function baseMission(entry) {
-  return {
-    id: entry.id,
-    kind: entry.kind,
-    title: entry.title,
-    brief: entry.brief,
-    objective: entry.objective,
-    reward: entry.reward,
-    spot: entry.spot || null,
-    target: entry.target ? { ...entry.target } : null,
-    points: entry.points ? [...entry.points] : null,
-    timeLimit: entry.timeLimit || 0,
-    targetCarId: entry.targetCarId || null,
-    targetCarModel: entry.targetCarModel || null,
-    gangCount: entry.gangCount || 0,
-    state: entry.state || 'locked',
-    // Field runtime, di-reset oleh startMission().
-    phase: 'start',
-    elapsed: 0,
-    timer: 0,
-    progress: {},
-  };
-}
+const REACH = (CFG && CFG.MISSION_ARRIVE_DIST) || 64; // px: arrive radius (B1 CFG)
+const RAM_DIST = 84;       // px: player/truck contact counts as a ram
+const RAM_DAMAGE = 34;     // truck hp lost per ram (= B2 SHOOT_DAMAGE scale)
+const RAM_COOLDOWN = 0.5;  // s between ram hits
+const TRUCK_SPEED = 250;   // px/s fleeing truck
+const TRUCK_HP = 100;
+const GUARD_COUNT = 5;
+const GUARD_HP = 100;
+const ESCAPE_DIST = 1200;  // px: truck escapes if player this far for too long
+const ESCAPE_TIME = 8;     // s beyond ESCAPE_DIST before the truck escapes
+const COURIER_TIME = 75;   // s for a courier delivery
+const TAXI_FAST_TIME = 45; // s: taxi bonus threshold
 
-export const missionList = [
-  baseMission({
-    id: 'm1',
-    kind: 'story',
-    title: 'Paket Pertama',
-    brief:
-      'Mira menelepon dari kantor pelabuhan: satu paket kecil harus sampai ' +
-      'ke kios Pasar Verda sebelum toko tutup. Anggap saja pemanasan — tapi ' +
-      'jangan sampai paketnya rusak di jalan.',
-    objective: 'Antar paket ke kios di Pasar Verda.',
-    reward: 50,
-    spot: 'market',
-    target: MISSION_SPOTS.market,
-    state: 'active',
-  }),
-  baseMission({
-    id: 'm2',
-    kind: 'story',
-    title: 'Di Bawah Patroli',
-    brief:
-      'Ada paket titipan di gudang timur. Polisi pelabuhan sedang rajin ' +
-      'merazia malam ini — ambil paketnya tanpa bikin masalah. Kalau ' +
-      'bintangmu naik di atas satu, Mira batal bayar.',
-    objective: 'Ambil paket di Gudang Timur. Jaga wanted tetap 1 atau kurang.',
-    reward: 120,
-    spot: 'warehouseEast',
-    target: MISSION_SPOTS.warehouseEast,
-  }),
-  baseMission({
-    id: 'm3',
-    kind: 'story',
-    title: 'Lepas Ekor',
-    brief:
-      'Sial — patroli mengenalimu. Dua mobil polisi menempel di ekor. Mira ' +
-      'bilang: jangan berhenti, jangan panik. Bertahan 60 detik sampai ' +
-      'mereka kehilangan jejakmu.',
-    objective: 'Lepas dari kejaran polisi selama 60 detik.',
-    reward: 200,
-    spot: 'pier',
-    target: MISSION_SPOTS.pier,
-    timeLimit: 60,
-  }),
-  baseMission({
-    id: 'm4',
-    kind: 'story',
-    title: 'Mobil Target',
-    brief:
-      'Harbor Kings menyimpan mobil curian di tempat parkir bukit — Falcon GT ' +
-      'warna kuning. Curi mobil itu dan bawa ke Bengkel Darto. Jangan sampai ' +
-      'mobilnya ringsek di jalan.',
-    objective: 'Curi Falcon GT, lalu antar ke Bengkel Darto.',
-    reward: 250,
-    spot: 'targetCar',
-    target: MISSION_SPOTS.targetCar,
-    targetCarId: 'target-car',
-    targetCarModel: 'Falcon GT',
-  }),
-  baseMission({
-    id: 'm5',
-    kind: 'story',
-    title: 'Gudang Harbor Kings',
-    brief:
-      'Ini balasan. Empat anggota Harbor Kings menjaga gudang mereka di ' +
-      'timur. Masuk, bereskan mereka, dan ambil kembali paket Mira yang ' +
-      'mereka sita.',
-    objective: 'Kalahkan 4 anggota Harbor Kings di gudang timur.',
-    reward: 400,
-    spot: 'warehouseEast',
-    target: MISSION_SPOTS.warehouseEast,
-    gangCount: 4,
-  }),
-  baseMission({
-    id: 'm6',
-    kind: 'story',
-    title: 'Finale Pelabuhan',
-    brief:
-      'Paket terakhir — dokumen pelabuhan yang bisa menjatuhkan Harbor Kings. ' +
-      'Seluruh pelabuhan panas, tiga bintang di kepalamu. Bawa paket itu ke ' +
-      'dermaga selatan. Di sana kapal Mira menunggu.',
-    objective: 'Antar paket terakhir ke Dermaga Selatan selagi wanted 3.',
-    reward: 600,
-    spot: 'pier',
-    target: MISSION_SPOTS.pier,
-  }),
-  baseMission({
-    id: 's1',
-    kind: 'side',
-    title: 'Taksi Pelabuhan',
-    brief:
-      'Sambil menunggu kabar Mira, ambil penumpang di depan terminal dan ' +
-      'antar mereka ke tiga titik di kota. Argo jalan terus.',
-    objective: 'Antar 3 penumpang: Pasar, Kota Tua, lalu Bukit.',
-    reward: 90,
-    spot: 'harborGate',
-    target: MISSION_SPOTS.harborGate,
-    points: ['market', 'oldTown', 'hills'],
-  }),
-  baseMission({
-    id: 's2',
-    kind: 'side',
-    title: 'Paket Kilat',
-    brief:
-      'Lima paket, satu tenggat: 150 detik. Antar semuanya sebelum waktu ' +
-      'habis — kalau telat, Mira yang menanggung malu ke pelanggan.',
-    objective: 'Antar 5 paket sebelum waktu habis (150 detik).',
-    reward: 150,
-    spot: 'downtown',
-    target: MISSION_SPOTS.downtown,
-    points: ['downtown', 'market', 'oldTown', 'garage', 'pier'],
-    timeLimit: 150,
-  }),
-];
-
-// Salinan segar daftar misi untuk satu permainan baru. main.js WAJIB memakai
-// ini (bukan missionList mentah) supaya dua permainan tidak berbagi state.
-export function freshMissionList() {
-  return JSON.parse(JSON.stringify(missionList));
-}
-
-// ---------------------------------------------------------------------------
-// Helper internal
-// ---------------------------------------------------------------------------
-
-function ensureMissions(state) {
-  if (!state.missions) {
-    state.missions = { current: 0, list: freshMissionList(), active: null, completed: [] };
-  }
-  if (!Array.isArray(state.missions.list) || state.missions.list.length === 0) {
-    state.missions.list = freshMissionList();
-  }
-  if (!Array.isArray(state.missions.completed)) state.missions.completed = [];
-  // Terapkan progres dari simpanan (save.js B1 hanya menyimpan daftar id
-  // selesai + current): tandai misi-misi itu 'done' di daftar baru.
-  if (state.missions.completed.length > 0) {
-    for (const entry of state.missions.list) {
-      if (entry && state.missions.completed.includes(entry.id) && entry.state !== 'done') {
-        entry.state = 'done';
-        entry.phase = 'done';
-      }
-    }
-  }
-  if (typeof state.missions.current !== 'number') state.missions.current = 0;
-  if (!state.flags) state.flags = {};
-  return state.missions;
-}
-
-// Ambil titik bernama: utamakan city.spawns.missionSpots (B1) — dengan
-// alias nama lokal -> nama B1 — lalu fallback ke MISSION_SPOTS lokal.
-// Mengembalikan salinan {x, y} atau null.
-function spotFor(state, city, key) {
-  const cityKey = SPOT_ALIASES[key] || key;
-  const spotsOf = (c) => (c && c.spawns && c.spawns.missionSpots ? c.spawns.missionSpots : null);
-  const fromParam = spotsOf(city);
-  const fromState = !fromParam || !fromParam[cityKey] ? spotsOf(state.city) : null;
-  const spot =
-    (fromParam && fromParam[cityKey]) ||
-    (fromState && fromState[cityKey]) ||
-    MISSION_SPOTS[key] ||
-    null;
-  return spot ? { x: spot.x, y: spot.y } : null;
-}
-
-function distanceTo(state, target) {
-  const p = state.player;
-  if (!p || !target) return Infinity;
-  const dx = (p.x || 0) - target.x;
-  const dy = (p.y || 0) - target.y;
+function dist(ax, ay, bx, by) {
+  const dx = ax - bx;
+  const dy = ay - by;
   return Math.sqrt(dx * dx + dy * dy);
 }
 
-// Jarak (piksel) pemain ke target misi aktif; Infinity bila tidak ada misi.
-export function missionDistanceToTarget(state) {
-  const missions = state.missions;
-  if (!missions || !missions.active || !missions.active.target) return Infinity;
-  return distanceTo(state, missions.active.target);
+/** Resolve a named location, preferring B1's city data on state when present. */
+export function getLocation(state, key) {
+  const def = LOCATIONS[key];
+  if (!def) return null;
+  const city = state && state.city;
+  if (city && city.spawns && Array.isArray(city.spawns.missionSpots)) {
+    const spotId = SPOT_IDS[key];
+    if (spotId) {
+      const spot = city.spawns.missionSpots.find((s) => s && s.id === spotId);
+      if (spot) return { x: spot.x, y: spot.y, district: def.district, label: spot.name || def.label };
+    }
+  }
+  if (city && city.locations && city.locations[key]) {
+    const l = city.locations[key];
+    return { x: l.x, y: l.y, district: def.district, label: def.label };
+  }
+  return { x: def.x, y: def.y, district: def.district, label: def.label };
 }
 
-function arrived(state, mission) {
-  return distanceTo(state, mission.target) <= ARRIVE_RADIUS;
+function ensureMissions(state) {
+  if (!state.missions) state.missions = { activeId: null, done: [], progress: {} };
+  const m = state.missions;
+  if (!Array.isArray(m.done)) m.done = [];
+  if (!m.progress || typeof m.progress !== 'object') m.progress = {};
+  if (!('activeId' in m)) m.activeId = null;
+  if (!('target' in m)) m.target = null;
+  if (!('active' in m)) m.active = null;
+  return m;
 }
 
-// Cari mobil target misi pencurian di state.cars. Cocok lewat id, lalu
-// model, lalu penanda isTarget — supaya B2/main bebas memakai salah satunya.
-function findTargetCar(state, mission) {
-  const cars = Array.isArray(state.cars) ? state.cars : [];
-  return (
-    cars.find((c) => c && mission.targetCarId && c.id === mission.targetCarId) ||
-    cars.find((c) => c && mission.targetCarModel && c.model === mission.targetCarModel) ||
-    cars.find((c) => c && c.isTarget === true) ||
-    null
+function ensureArray(state, key) {
+  if (!Array.isArray(state[key])) state[key] = [];
+  return state[key];
+}
+
+function setMessage(state, text, seconds = 4) {
+  const m = ensureMissions(state);
+  m.message = { text, until: (state.timeSeconds ?? 0) + seconds };
+  // render.js (B1) shows state.toast; mirror the briefing there too.
+  state.toast = { text, ttl: seconds };
+  if (!state.ui) state.ui = {};
+  state.ui.message = text;
+  state.ui.messageUntil = m.message.until;
+}
+
+/** Advance the shared mission clock (seconds of play). Called by updateMissions. */
+function tickClock(state, dt) {
+  if (typeof state.timeSeconds !== 'number') state.timeSeconds = 0;
+  state.timeSeconds += dt;
+}
+
+export const MISSIONS = [
+  {
+    id: 'm1', kind: 'story', order: 1, title: 'Paket Pertama',
+    reward: 150,
+    briefing: 'Mira: "Raka, paket pertama. Ambil di Dermaga 3, antar ke Pasar Ikan. Jalan kaki boleh, nyetir lebih cepat."',
+    objective: 'Ambil paket di dermaga, antar ke Pasar Ikan.',
+  },
+  {
+    id: 'm2', kind: 'story', order: 2, title: 'Di Bawah Patroli',
+    reward: 250,
+    briefing: 'Mira: "Paket di Industrial. Polisi lagi galak — jangan sampai wanted naik di atas 1. Pelan-pelan, jangan bikin ribut."',
+    objective: 'Ambil paket di Industrial, bawa kembali ke Mira tanpa wanted di atas 1.',
+  },
+  {
+    id: 'm3', kind: 'story', order: 3, title: 'Lepas dari Ekor',
+    reward: 300,
+    briefing: 'Mira: "Polisi nempel di ekormu, Raka. Wanted 2. Hilang dari pandangan mereka sampai wanted turun ke 0."',
+    objective: 'Lepas dari polisi sampai wanted turun ke 0.',
+  },
+  {
+    id: 'm4', kind: 'story', order: 4, title: 'Mobil Pesanan',
+    reward: 500,
+    briefing: 'Mira: "Ada pesanan: mobil sport merah di Menara Kembar, Downtown. Curi, bawa ke Bengkel Tua di Industrial. Jangan sampai hancur."',
+    objective: 'Curi mobil sport merah di Downtown, antar ke Bengkel Tua di Industrial tanpa hancur.',
+  },
+  {
+    id: 'm5', kind: 'story', order: 5, title: 'Gudang Harbor Kings',
+    reward: 600,
+    briefing: 'Mira: "Harbor Kings nyimpen kargo kita di Gudang 7, pelabuhan. Habisi penjaganya, ambil kargonya. Hati-hati, mereka bersenjata."',
+    objective: 'Kalahkan semua penjaga geng di gudang, lalu ambil kargo.',
+  },
+  {
+    id: 'm6', kind: 'story', order: 6, title: 'Finale Pelabuhan',
+    reward: 800,
+    briefing: 'Mira: "Truk Harbor Kings kabur ke Hills! Kejar dari Harbor, tabrak sampai berhenti sebelum keluar kota!"',
+    objective: 'Kejar truk yang kabur, tabrak sampai berhenti sebelum keluar kota.',
+  },
+  {
+    id: 'taxi', kind: 'side', order: 0, title: 'Taksi Verda',
+    reward: 50,
+    briefing: 'Penumpang menunggu. Antar ke tujuan secepatnya — makin cepat, makin besar tip.',
+    objective: 'Antar penumpang ke tujuan. Bisa diulang.',
+    repeatable: true,
+  },
+  {
+    id: 'courier', kind: 'side', order: 0, title: 'Kurir Kilat',
+    reward: 80,
+    briefing: 'Paket kilat, ada timernya. Antar sebelum waktu habis.',
+    objective: 'Antar paket sebelum timer habis. Bisa diulang.',
+    repeatable: true,
+  },
+];
+
+export function getMissionDef(id) {
+  return MISSIONS.find((m) => m.id === id) || null;
+}
+
+export function getActiveMission(state) {
+  const m = ensureMissions(state);
+  if (!m.activeId) return null;
+  const def = getMissionDef(m.activeId);
+  if (!def) return null;
+  const p = m.progress[m.activeId] || {};
+  return { ...def, stage: p.stage ?? 0, progress: p };
+}
+
+/** The next story mission the player may start (null when the story is done). */
+export function nextStoryMission(state) {
+  const m = ensureMissions(state);
+  for (const def of MISSIONS) {
+    if (def.kind !== 'story') continue;
+    if (!m.done.includes(def.id)) return def;
+  }
+  return null;
+}
+
+export function canStartMission(state, id) {
+  const m = ensureMissions(state);
+  const def = getMissionDef(id);
+  if (!def) return { ok: false, reason: `Misi tidak dikenal: ${id}` };
+  if (m.activeId) return { ok: false, reason: 'Masih ada misi aktif. Selesaikan atau gagalkan dulu.' };
+  if (state.mode === 'busted' || state.mode === 'wasted' || (state.health ?? 100) <= 0) {
+    return { ok: false, reason: 'Raka tidak bisa mulai misi sekarang.' };
+  }
+  if (def.kind === 'story') {
+    const next = nextStoryMission(state);
+    if (!next || next.id !== id) {
+      return { ok: false, reason: `Misi cerita harus berurutan. Berikutnya: ${next ? next.title : '—'}.` };
+    }
+  }
+  return { ok: true };
+}
+
+// ---- per-mission setup -------------------------------------------------------
+
+function spawnGuards(state, p) {
+  const peds = ensureArray(state, 'peds');
+  const base = getLocation(state, 'warehouse');
+  const spots = [
+    [0, 0], [-90, 40], [90, 30], [-40, -80], [60, -70],
+  ];
+  p.guardIds = [];
+  for (let i = 0; i < GUARD_COUNT; i += 1) {
+    const g = {
+      id: `m5-guard-${i}`,
+      x: base.x + spots[i][0],
+      y: base.y + spots[i][1],
+      angle: 0,
+      color: '#7a3b3b',
+      hp: GUARD_HP,
+      maxHp: GUARD_HP,
+      alive: true,
+      down: false,
+      gang: 'Harbor Kings',
+      missionGuard: true,
+      missionId: 'm5',
+      kind: 'guard',
+      speed: 0,
+    };
+    peds.push(g);
+    p.guardIds.push(g.id);
+  }
+  p.guardsTotal = GUARD_COUNT;
+}
+
+function spawnTargetCar(state) {
+  const cars = ensureArray(state, 'cars');
+  let car = cars.find((c) => c.id === 'm4-sport');
+  if (car) return car;
+  const loc = getLocation(state, 'downtownSport');
+  car = {
+    id: 'm4-sport',
+    model: 'sport',
+    color: '#e63946',
+    x: loc.x,
+    y: loc.y,
+    angle: 0,
+    speed: 0,
+    hp: 100,
+    maxHp: 100,
+    missionCar: true,
+    missionId: 'm4',
+  };
+  cars.push(car);
+  return car;
+}
+
+// Escape route Harbor -> Hills, following B1's roads (avenues/streets).
+const TRUCK_ROUTE = [
+  { x: 420, y: 1560 },
+  { x: 940, y: 1560 },
+  { x: 940, y: 1340 },
+  { x: 1720, y: 1340 },
+  { x: 1720, y: 1100 },
+  { x: 2540, y: 1100 },
+];
+
+function spawnTruck(state, p) {
+  const cars = ensureArray(state, 'cars');
+  let truck = cars.find((c) => c.id === 'm6-truck');
+  if (truck) return truck;
+  const start = getLocation(state, 'truckStart');
+  truck = {
+    id: 'm6-truck',
+    model: 'truck',
+    color: '#3a6ea5',
+    x: start.x,
+    y: start.y,
+    angle: 0,
+    speed: 0,
+    hp: TRUCK_HP,
+    maxHp: TRUCK_HP,
+    fleeing: true,
+    missionTruck: true,
+    missionId: 'm6',
+    waypoints: TRUCK_ROUTE.map((w) => ({ ...w })),
+  };
+  if (state.city && Array.isArray(state.city.m6Route)) truck.waypoints = state.city.m6Route;
+  cars.push(truck);
+  p.waypointIndex = 0;
+  return truck;
+}
+
+function pickTaxiTrip(state, p) {
+  const stands = ['taxiStandA', 'taxiStandB', 'taxiStandC', 'taxiStandD'];
+  const fromKey = stands[Math.floor(Math.random() * stands.length)];
+  let toKey = stands[Math.floor(Math.random() * stands.length)];
+  while (toKey === fromKey) toKey = stands[Math.floor(Math.random() * stands.length)];
+  p.pickupKey = fromKey;
+  p.destKey = toKey;
+  p.pickup = getLocation(state, fromKey);
+  p.dest = getLocation(state, toKey);
+  p.elapsed = 0;
+}
+
+function pickCourierTrip(state, p) {
+  const fromKey = Math.random() < 0.5 ? 'dockPickup' : 'industrialDrop';
+  const toKey = fromKey === 'dockPickup' ? 'marketShop' : 'miraBase';
+  p.pickupKey = fromKey;
+  p.destKey = toKey;
+  p.pickup = getLocation(state, fromKey);
+  p.dest = getLocation(state, toKey);
+  p.timeLeft = COURIER_TIME;
+  p.elapsed = 0;
+}
+
+/**
+ * Keep render.js's fields in sync: state.missions.active {id,name,objective}
+ * (top-centre banner) and state.missions.target {x,y,label} (world beacon +
+ * minimap blip). Null when no mission is active.
+ */
+export function syncMissionRender(state) {
+  const m = ensureMissions(state);
+  const active = getActiveMission(state);
+  if (!active) {
+    m.active = null;
+    m.target = null;
+    return;
+  }
+  const target = getMissionTarget(state);
+  m.active = { id: active.id, name: active.title, objective: objectiveText(state) || active.objective };
+  m.target = target ? { x: target.x, y: target.y, label: target.label } : null;
+}
+
+/**
+ * Start a mission. Returns {ok, reason?}. On success sets state.missions.activeId
+ * and initial progress; the HUD reads the briefing from getActiveMission().
+ */
+export function startMission(state, id) {
+  const check = canStartMission(state, id);
+  if (!check.ok) return check;
+  const m = ensureMissions(state);
+  const def = getMissionDef(id);
+  const prev = m.progress[id] || {};
+  const p = { stage: 0, startedAt: state.timeSeconds ?? 0, elapsed: 0 };
+  // Repeatable side jobs keep cumulative stats across runs.
+  if (def && def.kind === 'side') {
+    p.trips = prev.trips ?? 0;
+    p.earned = prev.earned ?? 0;
+  }
+  m.progress[id] = p;
+  m.activeId = id;
+  m.failedId = null;
+
+  if (id === 'm3') {
+    state.wanted = 2;
+    p.evadeStarted = true;
+  }
+  if (id === 'm4') spawnTargetCar(state);
+  if (id === 'm5') spawnGuards(state, p);
+  if (id === 'm6') spawnTruck(state, p);
+  if (id === 'taxi') pickTaxiTrip(state, p);
+  if (id === 'courier') pickCourierTrip(state, p);
+
+  setMessage(state, `${def.title} — ${def.briefing}`, 6);
+  syncMissionRender(state);
+  return { ok: true };
+}
+
+function completeMission(state, id, bonus = 0) {
+  const m = ensureMissions(state);
+  const def = getMissionDef(id);
+  const reward = (def ? def.reward : 0) + bonus;
+  state.money = (state.money ?? 0) + reward;
+  if (def && def.kind === 'story' && !m.done.includes(id)) m.done.push(id);
+  if (def && def.kind === 'side') {
+    const p = m.progress[id] || {};
+    p.trips = (p.trips ?? 0) + 1;
+    p.earned = (p.earned ?? 0) + reward;
+    m.progress[id] = p;
+  }
+  m.activeId = null;
+  m.lastResult = { id, outcome: 'completed', reward, at: state.timeSeconds ?? 0 };
+  setMessage(state, `Misi selesai: ${def ? def.title : id}! +$${reward}`, 5);
+  syncMissionRender(state);
+  return { type: 'completed', id, reward, title: def ? def.title : id };
+}
+
+function failMission(state, id, reason) {
+  const m = ensureMissions(state);
+  const def = getMissionDef(id);
+  m.activeId = null;
+  m.lastResult = { id, outcome: 'failed', reason, at: state.timeSeconds ?? 0 };
+  setMessage(state, `Misi gagal: ${def ? def.title : id} — ${reason}`, 5);
+  syncMissionRender(state);
+  return { type: 'failed', id, reason, title: def ? def.title : id };
+}
+
+function playerPos(state) {
+  const pl = state.player || {};
+  return { x: pl.x ?? 0, y: pl.y ?? 0 };
+}
+
+function nearPlayer(state, loc, radius = REACH) {
+  const p = playerPos(state);
+  return dist(p.x, p.y, loc.x, loc.y) <= radius;
+}
+
+function aliveGuards(state) {
+  const peds = Array.isArray(state.peds) ? state.peds : [];
+  const enemies = Array.isArray(state.enemies) ? state.enemies : [];
+  return [...peds, ...enemies].filter(
+    (g) => g && g.missionGuard && g.missionId === 'm5' && g.alive !== false && !g.down && (g.hp ?? 1) > 0,
   );
 }
 
-function targetCarDestroyed(state, mission) {
-  const car = findTargetCar(state, mission);
-  if (!car) return false; // belum muncul di dunia: belum bisa dibilang hancur
-  return car.wrecked === true || (typeof car.health === 'number' && car.health <= 0);
+function findCar(state, id) {
+  const cars = Array.isArray(state.cars) ? state.cars : [];
+  return cars.find((c) => c && c.id === id) || null;
 }
 
-// Hitung anggota geng yang sudah kalah di sekitar misi. Dua sumber dihitung
-// dan diambil yang terbesar supaya tidak ganda: penghitung flags.gangKills
-// (ditambah combat.js) dan pejalan kaki bertanda gang yang sudah tumbang.
-function countGangDown(state) {
-  let counted = 0;
-  if (state.flags && Number.isFinite(state.flags.gangKills)) {
-    counted = Math.max(0, Math.floor(state.flags.gangKills));
-  }
-  const peds = Array.isArray(state.peds) ? state.peds : [];
-  let down = 0;
-  for (const p of peds) {
-    if (p && p.gang === true && (p.dead === true || (typeof p.health === 'number' && p.health <= 0))) {
-      down += 1;
+// ---- per-frame update ---------------------------------------------------------
+
+function updateStory(state, dt, id, p) {
+  const pl = state.player || {};
+  const px = pl.x ?? 0;
+  const py = pl.y ?? 0;
+
+  // Any mission fails if Raka goes down.
+  if ((state.health ?? 100) <= 0) return failMission(state, id, 'Raka tumbang.');
+
+  if (id === 'm1') {
+    if (p.stage === 0) {
+      if (nearPlayer(state, getLocation(state, 'dockPickup'))) {
+        p.stage = 1;
+        p.hasPackage = true;
+        setMessage(state, 'Paket diambil! Antar ke Pasar Ikan.', 4);
+      }
+    } else if (nearPlayer(state, getLocation(state, 'marketShop'))) {
+      return completeMission(state, id);
     }
+    return null;
   }
-  return Math.max(counted, down);
-}
 
-// ---------------------------------------------------------------------------
-// Penyelesaian / kegagalan
-// ---------------------------------------------------------------------------
-
-function completeMission(state, mission, events) {
-  mission.state = 'done';
-  mission.phase = 'done';
-  if (typeof state.money !== 'number') state.money = 0;
-  state.money += mission.reward;
-  // Catat ke daftar selesai supaya save.js (B1) bisa menyimpan progres.
-  const missions = state.missions;
-  if (Array.isArray(missions.completed) && !missions.completed.includes(mission.id)) {
-    missions.completed.push(mission.id);
-  }
-  // Bersihkan jadwal retry basi untuk misi ini (mis. pemain me-retry manual
-  // sebelum timer retry habis).
-  if (state.flags.retryMission === missions.list.indexOf(mission)) {
-    state.flags.retryMission = null;
-    state.flags.retryIn = 0;
-  }
-  state.flags.lastMissionEvent = 'complete';
-  state.flags.lastMissionId = mission.id;
-  state.flags.lastMissionReward = mission.reward;
-  // Banner "MISI SELESAI" di HUD tampil selama 4 detik (lihat updateMissions).
-  state.flags.missionBannerTimer = 4;
-  state.flags.showBrief = false;
-  state.flags.briefTimer = 0;
-  if (mission.id === 'm4') state.flags.targetCarNeeded = false;
-  events.push('mission_complete:' + mission.id);
-
-  missions.active = null;
-
-  if (mission.kind === 'story') {
-    // Buka misi cerita berikutnya yang masih terkunci, langsung aktif.
-    const nextIndex = missions.list.findIndex(
-      (m, idx) => idx > missions.current && m.kind === 'story' && m.state === 'locked',
-    );
-    if (nextIndex >= 0) {
-      startMission(state, nextIndex);
-      events.push('mission_start:' + missions.list[nextIndex].id);
+  if (id === 'm2') {
+    if ((state.wanted ?? 0) > 1) return failMission(state, id, 'Wanted naik di atas 1 — patroli mengejarmu.');
+    if (p.stage === 0) {
+      if (nearPlayer(state, getLocation(state, 'industrialDrop'))) {
+        p.stage = 1;
+        p.hasPackage = true;
+        setMessage(state, 'Paket didapat! Bawa kembali ke Mira di Harbor. Jangan bikin ribut.', 4);
+      }
+    } else if (nearPlayer(state, getLocation(state, 'miraBase'))) {
+      return completeMission(state, id);
     }
-  } else if (mission.resumeIndex !== undefined && mission.resumeIndex !== null) {
-    // Side job selesai: kembali ke misi cerita yang tadi dijeda.
-    const resume = missions.list[mission.resumeIndex];
-    if (resume && resume.state === 'active') {
-      missions.current = mission.resumeIndex;
-      missions.active = resume;
-      events.push('mission_resume:' + resume.id);
-    }
-    mission.resumeIndex = null;
-  }
-}
-
-function failMission(state, mission, reason, events) {
-  mission.state = 'failed';
-  mission.phase = 'failed';
-  state.flags.lastMissionEvent = 'failed';
-  state.flags.lastMissionId = mission.id;
-  state.flags.lastMissionFailReason = reason;
-  // Banner "MISI GAGAL" di HUD tampil selama 4 detik (lihat updateMissions).
-  state.flags.missionBannerTimer = 4;
-  state.flags.showBrief = false;
-  state.flags.briefTimer = 0;
-  if (mission.id === 'm4') state.flags.targetCarNeeded = false;
-  events.push('mission_failed:' + mission.id + ':' + reason);
-
-  const missions = state.missions;
-  missions.active = null;
-
-  // Misi cerita yang gagal diulang otomatis setelah 6 detik (retry), supaya
-  // permainan tidak berhenti tanpa misi aktif. Pengecualian: gagal karena
-  // health 0 / busted — layar game over main.js yang mengambil alih, dan
-  // updateMissions tidak lagi dipanggil di sana.
-  if (
-    mission.kind === 'story' &&
-    reason !== 'health' &&
-    reason !== 'busted' &&
-    missions.list.indexOf(mission) >= 0
-  ) {
-    state.flags.retryMission = missions.list.indexOf(mission);
-    state.flags.retryIn = 6;
+    return null;
   }
 
-  if (mission.kind === 'side' && mission.resumeIndex !== undefined && mission.resumeIndex !== null) {
-    const resume = missions.list[mission.resumeIndex];
-    if (resume && resume.state === 'active') {
-      missions.current = mission.resumeIndex;
-      missions.active = resume;
-      events.push('mission_resume:' + resume.id);
-    }
-    mission.resumeIndex = null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// API utama
-// ---------------------------------------------------------------------------
-
-// Mulai misi ke-i dari state.missions.list. Mengembalikan true bila misi
-// berhasil diaktifkan. Misi cerita yang terkunci hanya bisa dimulai bila
-// semua misi cerita sebelumnya sudah 'done'. Side job selalu bisa dimulai.
-// Misi 'done' tidak bisa diulang; misi 'failed' bisa dicoba lagi.
-// `city` opsional: objek kota B1 (dipakai untuk city.spawns.missionSpots
-// dan disimpan ke state.city supaya updateMissions berikutnya memakainya).
-export function startMission(state, i, city) {
-  const missions = ensureMissions(state);
-  if (city) state.city = city;
-  const mission = missions.list[i];
-  if (!mission) return false;
-  if (mission.state === 'done') return false;
-  if (mission.state === 'active' && missions.active === mission && mission.elapsed === 0) {
-    return true; // sudah aktif dan belum berjalan: tidak perlu reset ulang
+  if (id === 'm3') {
+    if ((state.wanted ?? 0) <= 0) return completeMission(state, id);
+    return null;
   }
 
-  if (mission.kind === 'story' && mission.state === 'locked') {
-    for (let k = 0; k < i; k += 1) {
-      const prev = missions.list[k];
-      if (prev && prev.kind === 'story' && prev.state !== 'done') return false;
-    }
-  }
-
-  // Side job yang memotong misi cerita aktif: simpan indeksnya untuk resume.
-  if (
-    mission.kind === 'side' &&
-    missions.active &&
-    missions.active.kind === 'story' &&
-    missions.active.state === 'active'
-  ) {
-    mission.resumeIndex = missions.current;
-  } else {
-    mission.resumeIndex = null;
-  }
-
-  mission.state = 'active';
-  mission.phase = 'start';
-  mission.elapsed = 0;
-  mission.timer = mission.timeLimit || 0;
-  mission.progress = {};
-  missions.current = i;
-  missions.active = mission;
-
-  // Selesaikan target dari nama spot (utamakan city B1 bila tersedia).
-  if (mission.spot) {
-    const resolved = spotFor(state, city, mission.spot);
-    if (resolved) mission.target = resolved;
-  }
-  if (mission.points && mission.points.length > 0) {
-    mission.progress.index = 0;
-    // Side job taksi: target pertama adalah titik penjemputan (spot misi),
-    // baru sesudah itu titik-titik antar. Paket kilat: langsung titik pertama.
-    if (mission.id === 's1') {
-      mission.phase = 'pickup';
+  if (id === 'm4') {
+    const car = findCar(state, 'm4-sport') || spawnTargetCar(state);
+    if (p.stage === 0) {
+      if (pl.inCar && pl.carId === 'm4-sport') {
+        p.stage = 1;
+        setMessage(state, 'Mobil sport didapat! Bawa ke Bengkel Tua di Industrial — jangan sampai hancur.', 4);
+      }
     } else {
-      const first = spotFor(state, city, mission.points[0]);
-      if (first) mission.target = first;
-      mission.phase = 'deliver';
+      if (!car || (car.hp ?? 100) <= 0) return failMission(state, id, 'Mobil pesanan hancur.');
+      if (pl.inCar && pl.carId === 'm4-sport' && nearPlayer(state, getLocation(state, 'industrialGarage'))) {
+        return completeMission(state, id);
+      }
     }
+    return null;
   }
 
-  // Efek awal khusus tiap misi.
-  if (mission.id === 'm3') {
-    state.wanted = 2;
-    mission.progress.startWanted = 2;
-  }
-  if (mission.id === 'm6') {
-    state.wanted = 3;
-    mission.progress.startWanted = 3;
-  }
-  if (mission.id === 'm4') {
-    state.flags.targetCarNeeded = true;
-    const spawn = spotFor(state, city, 'targetCar');
-    if (spawn) {
-      state.flags.targetCarSpawn = spawn;
-      mission.target = { ...spawn };
+  if (id === 'm5') {
+    const guards = aliveGuards(state);
+    p.guardsLeft = guards.length;
+    if (p.stage === 0) {
+      if (guards.length === 0) {
+        p.stage = 1;
+        setMessage(state, 'Semua penjaga tumbang! Ambil kargo di tengah gudang.', 4);
+      }
+    } else if (nearPlayer(state, getLocation(state, 'warehouse'))) {
+      return completeMission(state, id);
     }
-    mission.phase = 'steal';
-  }
-  if (mission.id === 'm5') {
-    const warehouse = spotFor(state, city, 'warehouseEast');
-    state.flags.spawnGang = {
-      x: warehouse ? warehouse.x : mission.target.x,
-      y: warehouse ? warehouse.y : mission.target.y,
-      count: mission.gangCount || 4,
-    };
-    state.flags.gangKills = 0;
-    mission.progress.kills = 0;
-    mission.phase = 'fight';
+    return null;
   }
 
-  // Minta main.js menampilkan panel brief misi selama beberapa detik.
-  state.flags.showBrief = true;
-  state.flags.briefTimer = 6;
-  // SENGAJA tidak menyentuh state.flags.lastMissionEvent di sini: bila misi
-  // ini di-auto-start oleh completeMission misi sebelumnya, event 'complete'
-  // beserta reward-nya harus tetap bisa dibaca HUD / main.js (untuk banner
-  // dan jingle) sampai missionBannerTimer-nya habis.
-  state.flags.lastMissionId = mission.id;
-  return true;
+  if (id === 'm6') {
+    const truck = findCar(state, 'm6-truck');
+    if (!truck) return failMission(state, id, 'Truk menghilang.');
+    if ((truck.hp ?? TRUCK_HP) <= 0) return completeMission(state, id);
+    // Drive the truck along its escape route.
+    const wps = truck.waypoints || [];
+    const lastWp = wps[wps.length - 1];
+    // Reaching the final exit point by any means is an escape.
+    if (lastWp && dist(truck.x, truck.y, lastWp.x, lastWp.y) < 40) {
+      return failMission(state, id, 'Truk keluar kota lewat Hills.');
+    }
+    const wi = p.waypointIndex ?? 0;
+    const wp = wps[wi];
+    if (wp) {
+      const d = dist(truck.x, truck.y, wp.x, wp.y);
+      if (d < 40) {
+        if (wi >= wps.length - 1) return failMission(state, id, 'Truk keluar kota lewat Hills.');
+        p.waypointIndex = wi + 1;
+      } else {
+        const step = TRUCK_SPEED * dt;
+        truck.x += ((wp.x - truck.x) / d) * step;
+        truck.y += ((wp.y - truck.y) / d) * step;
+        truck.angle = Math.atan2(wp.y - truck.y, wp.x - truck.x);
+        truck.speed = TRUCK_SPEED;
+      }
+    }
+    // Ram: player (on foot or in a car) touches the truck.
+    const dPlayer = dist(px, py, truck.x, truck.y);
+    p.lastRam = p.lastRam ?? -10;
+    if (dPlayer <= RAM_DIST && (state.timeSeconds ?? 0) - p.lastRam >= RAM_COOLDOWN) {
+      p.lastRam = state.timeSeconds ?? 0;
+      truck.hp = (truck.hp ?? TRUCK_HP) - RAM_DAMAGE;
+      p.hits = (p.hits ?? 0) + 1;
+      setMessage(state, `Tabrakan! Truk rusak (${Math.max(0, truck.hp)}/100). Terus tabrak!`, 2);
+      if (truck.hp <= 0) return completeMission(state, id);
+    }
+    // Escape: player too far away for too long.
+    if (dPlayer > ESCAPE_DIST) {
+      p.farTime = (p.farTime ?? 0) + dt;
+      if (p.farTime >= ESCAPE_TIME) return failMission(state, id, 'Truk lolos — kamu terlalu jauh.');
+    } else {
+      p.farTime = 0;
+    }
+    return null;
+  }
+
+  return null;
 }
 
-// Dipanggil tiap frame oleh main.js. Mengembalikan array event string
-// (bisa kosong): 'mission_complete:<id>', 'mission_failed:<id>:<alasan>',
-// 'mission_start:<id>', 'mission_resume:<id>', 'target_car_stolen'.
-// `city` boleh null/undefined — semua logika memakai state + konstanta lokal.
-export function updateMissions(state, dt, city) {
-  const events = [];
-  if (!state || typeof state !== 'object') return events;
-  const missions = ensureMissions(state);
-  // Simpan kota B1 di state supaya startMission berikutnya (yang tidak
-  // menerima city) tetap bisa memakai city.spawns.missionSpots.
-  if (city) state.city = city;
-  if (!(dt > 0)) dt = 0;
-  // Hitung mundur banner hasil misi ("MISI SELESAI" / "MISI GAGAL" di HUD).
-  // Dijalankan sebelum early-return: banner tampil justru saat tidak ada
-  // misi aktif (misi baru saja selesai / gagal).
-  if (state.flags.missionBannerTimer > 0) {
-    state.flags.missionBannerTimer -= dt;
-    if (state.flags.missionBannerTimer <= 0) {
-      state.flags.lastMissionEvent = 'none';
-    }
-  }
-  const mission = missions.active;
-  if (!mission) {
-    // Tanpa misi aktif, modul ini menjaga alur cerita tetap berjalan:
-    //  1. hitung mundur retry misi cerita yang gagal (lihat failMission);
-    //  2. lanjutkan misi yang sedang 'active' tapi belum terpasang
-    //     (mis. setelah load save);
-    //  3. mulai misi cerita yang ditunjuk state.missions.current;
-    //  4. permainan baru: mulai misi cerita pertama.
-    // Bila semua misi cerita sudah selesai / gagal tanpa retry, diam.
-    if (typeof state.flags.retryMission === 'number' && state.flags.retryIn > 0) {
-      state.flags.retryIn -= dt;
-      if (state.flags.retryIn <= 0) {
-        const retryIndex = state.flags.retryMission;
-        state.flags.retryMission = null;
-        state.flags.retryIn = 0;
-        if (startMission(state, retryIndex)) {
-          events.push('mission_retry:' + missions.list[retryIndex].id);
-        }
+function updateSide(state, dt, id, p) {
+  if ((state.health ?? 100) <= 0) return failMission(state, id, 'Raka tumbang.');
+  p.elapsed = (p.elapsed ?? 0) + dt;
+
+  if (id === 'taxi') {
+    if (p.stage === 0) {
+      if (nearPlayer(state, p.pickup || getLocation(state, p.pickupKey || 'taxiStandA'))) {
+        p.stage = 1;
+        setMessage(state, `Penumpang naik! Antar ke ${p.dest ? p.dest.label : 'tujuan'}.`, 4);
       }
-      return events;
+    } else if (nearPlayer(state, p.dest || getLocation(state, p.destKey || 'taxiStandB'))) {
+      const bonus = p.elapsed <= TAXI_FAST_TIME ? 20 : 0;
+      return completeMission(state, id, bonus);
     }
-    const activeIndex = missions.list.findIndex((m) => m && m.state === 'active');
-    if (activeIndex >= 0) {
-      startMission(state, activeIndex);
-      events.push('mission_resume:' + missions.list[activeIndex].id);
-      return events;
-    }
-    if (
-      typeof missions.current === 'number' &&
-      missions.list[missions.current] &&
-      missions.list[missions.current].kind === 'story' &&
-      missions.list[missions.current].state !== 'done'
-    ) {
-      if (startMission(state, missions.current)) {
-        events.push('mission_start:' + missions.list[missions.current].id);
-      }
-      return events;
-    }
-    const anyStoryDone = missions.list.some((m) => m && m.kind === 'story' && m.state === 'done');
-    const anyStoryFailed = missions.list.some((m) => m && m.kind === 'story' && m.state === 'failed');
-    if (!anyStoryDone && !anyStoryFailed) {
-      const firstStory = missions.list.findIndex((m) => m && m.kind === 'story');
-      if (firstStory >= 0 && startMission(state, firstStory)) {
-        events.push('mission_start:' + missions.list[firstStory].id);
-      }
-    }
-    return events;
+    return null;
   }
 
-  // Hitung mundur panel brief misi.
-  if (state.flags.briefTimer > 0) {
-    state.flags.briefTimer -= dt;
-    if (state.flags.briefTimer <= 0) state.flags.showBrief = false;
-  }
-
-  mission.elapsed += dt;
-  if (mission.timer > 0) mission.timer -= dt;
-
-  // Gagal global: pemain tumbang (WASTED) atau tertangkap (BUSTED) —
-  // main.js yang memutuskan tampilan game over; di sini misi ditandai gagal.
-  if (typeof state.health === 'number' && state.health <= 0) {
-    failMission(state, mission, 'health', events);
-    return events;
-  }
-  if (state.flags && state.flags.busted === true) {
-    failMission(state, mission, 'busted', events);
-    return events;
-  }
-
-  switch (mission.id) {
-    case 'm1': {
-      if (arrived(state, mission)) completeMission(state, mission, events);
-      break;
-    }
-    case 'm2': {
-      if (typeof state.wanted === 'number' && state.wanted > 1) {
-        failMission(state, mission, 'wanted', events);
-      } else if (arrived(state, mission)) {
-        completeMission(state, mission, events);
+  if (id === 'courier') {
+    p.timeLeft = (p.timeLeft ?? COURIER_TIME) - dt;
+    if (p.timeLeft <= 0) return failMission(state, id, 'Waktu habis — paket terlambat.');
+    if (p.stage === 0) {
+      if (nearPlayer(state, p.pickup || getLocation(state, p.pickupKey || 'dockPickup'))) {
+        p.stage = 1;
+        p.hasPackage = true;
+        setMessage(state, `Paket diambil! Sisa waktu ${Math.ceil(p.timeLeft)} dtk — antar ke tujuan.`, 4);
       }
-      break;
+    } else if (nearPlayer(state, p.dest || getLocation(state, p.destKey || 'marketShop'))) {
+      return completeMission(state, id);
     }
-    case 'm3': {
-      // Lolos lebih cepat bila wanted sudah 0 setelah 15 detik pertama.
-      if (typeof state.wanted === 'number' && state.wanted <= 0 && mission.elapsed > 15) {
-        completeMission(state, mission, events);
-      } else if (mission.timer <= 0) {
-        completeMission(state, mission, events);
-      }
-      break;
-    }
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Advance the active mission one frame. Returns an event object
+ * {type:'completed'|'failed', id, ...} when a mission resolves, else null.
+ * Also advances the mission clock, expires transient messages and keeps
+ * render.js's missions.active / missions.target in sync.
+ */
+export function updateMissions(state, dt) {
+  const m = ensureMissions(state);
+  tickClock(state, dt);
+  if (m.message && (state.timeSeconds ?? 0) > m.message.until) m.message = null;
+  if (state.toast && typeof state.toast.ttl === 'number') {
+    state.toast.ttl -= dt;
+    if (state.toast.ttl <= 0) state.toast = null;
+  }
+  if (!m.activeId) {
+    syncMissionRender(state);
+    return null;
+  }
+  const def = getMissionDef(m.activeId);
+  if (!def) {
+    m.activeId = null;
+    syncMissionRender(state);
+    return null;
+  }
+  const p = m.progress[m.activeId] || {};
+  m.progress[m.activeId] = p;
+  const event = def.kind === 'story'
+    ? updateStory(state, dt, m.activeId, p)
+    : updateSide(state, dt, m.activeId, p);
+  syncMissionRender(state);
+  return event;
+}
+
+/** Current objective target for arrow + minimap blip, or null when idle. */
+export function getMissionTarget(state) {
+  const active = getActiveMission(state);
+  if (!active) return null;
+  const p = active.progress || {};
+  switch (active.id) {
+    case 'm1':
+      return p.stage === 0
+        ? { ...getLocation(state, 'dockPickup'), label: 'Ambil paket' }
+        : { ...getLocation(state, 'marketShop'), label: 'Antar paket' };
+    case 'm2':
+      return p.stage === 0
+        ? { ...getLocation(state, 'industrialDrop'), label: 'Ambil paket' }
+        : { ...getLocation(state, 'miraBase'), label: 'Kembali ke Mira' };
+    case 'm3':
+      return null; // evade: no fixed point; HUD shows "lepas dari polisi"
     case 'm4': {
-      if (targetCarDestroyed(state, mission)) {
-        failMission(state, mission, 'car_destroyed', events);
-        break;
+      if (p.stage === 0) {
+        const car = findCar(state, 'm4-sport');
+        const loc = car ? { x: car.x, y: car.y } : getLocation(state, 'downtownSport');
+        return { ...loc, label: 'Mobil sport merah' };
       }
-      const car = findTargetCar(state, mission);
-      const inTargetCar =
-        !!car && state.player && state.player.onFoot === false && state.player.carId === car.id;
-      if (mission.phase === 'steal') {
-        if (inTargetCar) {
-          mission.phase = 'deliver';
-          const garage = spotFor(state, city, 'garage');
-          if (garage) mission.target = garage;
-          events.push('target_car_stolen');
-          state.flags.lastMissionEvent = 'target_car_stolen';
-        }
-      } else if (inTargetCar && arrived(state, mission)) {
-        completeMission(state, mission, events);
-      }
-      break;
+      return { ...getLocation(state, 'industrialGarage'), label: 'Bengkel Tua (Industrial)' };
     }
-    case 'm5': {
-      const kills = countGangDown(state);
-      mission.progress.kills = kills;
-      if (kills >= (mission.gangCount || 4)) {
-        completeMission(state, mission, events);
-      }
-      break;
-    }
+    case 'm5':
+      return p.stage === 0
+        ? { ...getLocation(state, 'warehouse'), label: `Kalahkan penjaga (${p.guardsLeft ?? GUARD_COUNT} tersisa)` }
+        : { ...getLocation(state, 'warehouse'), label: 'Ambil kargo' };
     case 'm6': {
-      if (arrived(state, mission)) completeMission(state, mission, events);
-      break;
+      const truck = findCar(state, 'm6-truck');
+      if (!truck) return { ...getLocation(state, 'hillsExit'), label: 'Truk kabur' };
+      return { x: truck.x, y: truck.y, label: `Tabrak truk! (${Math.max(0, truck.hp ?? TRUCK_HP)}/100)` };
     }
-    case 's1': {
-      if (mission.phase === 'pickup') {
-        if (arrived(state, mission)) {
-          mission.phase = 'deliver';
-          mission.progress.index = 0;
-          const next = spotFor(state, city, mission.points[0]);
-          if (next) mission.target = next;
-          events.push('taxi_pickup');
-        }
-      } else if (arrived(state, mission)) {
-        mission.progress.index += 1;
-        if (mission.progress.index >= mission.points.length) {
-          completeMission(state, mission, events);
-        } else {
-          const next = spotFor(state, city, mission.points[mission.progress.index]);
-          if (next) mission.target = next;
-          events.push('taxi_dropoff:' + mission.progress.index);
-        }
-      }
-      break;
-    }
-    case 's2': {
-      if (arrived(state, mission)) {
-        mission.progress.index = (mission.progress.index || 0) + 1;
-        if (mission.progress.index >= mission.points.length) {
-          completeMission(state, mission, events);
-        } else {
-          const next = spotFor(state, city, mission.points[mission.progress.index]);
-          if (next) mission.target = next;
-          events.push('package_delivered:' + mission.progress.index);
-        }
-      } else if (mission.timer <= 0) {
-        failMission(state, mission, 'timeout', events);
-      }
-      break;
-    }
-    default: {
-      if (arrived(state, mission)) completeMission(state, mission, events);
-      break;
-    }
+    case 'taxi':
+      return p.stage === 0
+        ? { ...(p.pickup || getLocation(state, 'taxiStandA')), label: 'Jemput penumpang' }
+        : { ...(p.dest || getLocation(state, 'taxiStandB')), label: 'Antar penumpang' };
+    case 'courier':
+      return p.stage === 0
+        ? { ...(p.pickup || getLocation(state, 'dockPickup')), label: 'Ambil paket' }
+        : { ...(p.dest || getLocation(state, 'marketShop')), label: `Antar paket (${Math.ceil(p.timeLeft ?? COURIER_TIME)} dtk)` };
+    default:
+      return null;
   }
-  return events;
 }
+
+/** Blips for B1's minimap (render.js): mission target + police + truck. */
+export function getMinimapBlips(state) {
+  const blips = [];
+  const target = getMissionTarget(state);
+  if (target) blips.push({ x: target.x, y: target.y, color: '#ffd23f', kind: 'mission' });
+  const police = Array.isArray(state.police) ? state.police : [];
+  for (const cop of police) {
+    if (cop) blips.push({ x: cop.x ?? 0, y: cop.y ?? 0, color: '#4fc3f7', kind: 'police' });
+  }
+  const truck = findCar(state, 'm6-truck');
+  if (truck && getActiveMission(state)?.id === 'm6') {
+    blips.push({ x: truck.x, y: truck.y, color: '#e63946', kind: 'truck' });
+  }
+  return blips;
+}
+
+/** Distance (px) from the player to the current target, or null. */
+export function distanceToTarget(state) {
+  const t = getMissionTarget(state);
+  if (!t) return null;
+  const p = playerPos(state);
+  return dist(p.x, p.y, t.x, t.y);
+}
+
+/** One-line objective text for the HUD tracker. */
+export function objectiveText(state) {
+  const active = getActiveMission(state);
+  if (!active) return null;
+  const target = getMissionTarget(state);
+  const d = distanceToTarget(state);
+  const distText = d === null ? '' : ` — ${Math.max(0, Math.round(d / 10))} m`;
+  if (active.id === 'm3') return `${active.title}: lepas dari polisi sampai wanted 0 (sekarang ${state.wanted ?? 0})`;
+  if (active.id === 'm5' && active.progress.stage === 0) {
+    return `${active.title}: kalahkan penjaga (${active.progress.guardsLeft ?? GUARD_COUNT} tersisa)`;
+  }
+  return `${active.title}: ${target ? target.label : active.objective}${distText}`;
+}
+
+export { REACH, COURIER_TIME, TAXI_FAST_TIME, GUARD_COUNT, TRUCK_HP, TRUCK_ROUTE };

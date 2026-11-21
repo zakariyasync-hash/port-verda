@@ -1,63 +1,65 @@
-// rng.js — deterministic seeded random helpers for Port Verda.
-// Everything in the world generator draws from one mulberry32 stream so a
-// city built from the same seed is byte-for-byte the same city every time.
-
+// rng.js — seeded random numbers for Port Verda.
+// mulberry32: small, fast, deterministic PRNG. Same seed => same city,
+// same traffic, same everything. Used by city generation, spawns and
+// anything else that must be reproducible between runs.
 export function mulberry32(seed) {
   let a = seed >>> 0;
   return function next() {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-// Float in [min, max).
-export function rand(rng, min, max) {
+// Create an rng object with named helpers bound to one stream.
+export function createRng(seed) {
+  const next = mulberry32(seed);
+  return {
+    next,
+    // Float in [min, max).
+    rand(min = 0, max = 1) {
+      return min + next() * (max - min);
+    },
+    // Integer in [min, max] inclusive.
+    randInt(min, max) {
+      return Math.floor(min + next() * (max - min + 1));
+    },
+    // Random element of an array.
+    pick(arr) {
+      return arr[Math.floor(next() * arr.length)];
+    },
+    // True with probability p (0..1).
+    chance(p) {
+      return next() < p;
+    },
+    // In-place Fisher-Yates shuffle, returns the array.
+    shuffle(arr) {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(next() * (i + 1));
+        const tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+      }
+      return arr;
+    },
+  };
+}
+
+// Standalone helpers for code that already holds a next() function.
+export function rand(rng, min = 0, max = 1) {
   return min + rng() * (max - min);
 }
 
-// Integer in [min, max] inclusive.
 export function randInt(rng, min, max) {
-  return Math.floor(rand(rng, min, max + 1));
+  return Math.floor(min + rng() * (max - min + 1));
 }
 
-// One element of an array, uniformly.
 export function pick(rng, arr) {
   return arr[Math.floor(rng() * arr.length)];
 }
 
-// True with probability p (0..1).
 export function chance(rng, p) {
   return rng() < p;
-}
-
-// In-place Fisher-Yates shuffle, returns the same array.
-export function shuffle(rng, arr) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    const tmp = arr[i];
-    arr[i] = arr[j];
-    arr[j] = tmp;
-  }
-  return arr;
-}
-
-// Pick one element with weights: items[i] is chosen with probability
-// weights[i] / sum(weights). Weights must be non-negative, at least one > 0.
-export function pickWeighted(rng, items, weights) {
-  let total = 0;
-  for (const w of weights) total += w;
-  let roll = rng() * total;
-  for (let i = 0; i < items.length; i++) {
-    roll -= weights[i];
-    if (roll <= 0) return items[i];
-  }
-  return items[items.length - 1];
-}
-
-// A small gaussian-ish value centred on 0, in roughly [-1, 1].
-export function bell(rng) {
-  return (rng() + rng() + rng() - 1.5) / 1.5;
 }
